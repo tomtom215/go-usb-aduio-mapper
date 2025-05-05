@@ -7,19 +7,40 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io/fs"
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+)
+
+// Version information
+const (
+	AppName    = "usb-soundcard-mapper"
+	AppVersion = "1.3.0"
+)
+
+// viewState represents the current UI state
+type viewState int
+
+const (
+	stateCardSelect viewState = iota
+	stateNameInput
+	stateConfirmation
+	stateError
 )
 
 // USBSoundCard represents a USB sound card device
@@ -45,18 +66,59 @@ type Config struct {
 	DeviceName      string
 	VendorID        string
 	ProductID       string
+	Debug           bool
+	SkipReload      bool
+}
+
+// Logger provides structured logging with debug capability
+type Logger struct {
+	debug bool
+	mu    sync.Mutex
+}
+
+// NewLogger creates a new logger instance
+func NewLogger(debug bool) *Logger {
+	return &Logger{
+		debug: debug,
+	}
+}
+
+// Info logs informational messages
+func (l *Logger) Info(format string, v ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	log.Printf("[INFO] "+format, v...)
+}
+
+// Error logs error messages
+func (l *Logger) Error(format string, v ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	log.Printf("[ERROR] "+format, v...)
+}
+
+// Debug logs debug messages only when debug mode is enabled
+func (l *Logger) Debug(format string, v ...interface{}) {
+	if !l.debug {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	log.Printf("[DEBUG] "+format, v...)
 }
 
 // CommandExecutor wraps command execution with proper error handling
 type CommandExecutor struct {
 	// DefaultTimeout is the default timeout for command execution
 	DefaultTimeout time.Duration
+	logger         *Logger
 }
 
 // NewCommandExecutor creates a new command executor
-func NewCommandExecutor() *CommandExecutor {
+func NewCommandExecutor(logger *Logger) *CommandExecutor {
 	return &CommandExecutor{
 		DefaultTimeout: 5 * time.Second,
+		logger:         logger,
 	}
 }
 
@@ -70,6 +132,7 @@ func (ce *CommandExecutor) ExecuteCommandWithTimeout(timeout time.Duration, comm
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
+	ce.logger.Debug("Executing command: %s %v", command, args)
 	cmd := exec.CommandContext(ctx, command, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -137,12 +200,16 @@ func GetUSBSoundCards(executor *CommandExecutor) ([]USBSoundCard, error) {
 			// Get more details about this card
 			card, err := getCardDetails(executor, cardNumber)
 			if err != nil {
-				log.Printf("Warning: Failed to get details for card %s: %v", cardNumber, err)
+				executor.logger.Error("Failed to get details for card %s: %v", cardNumber, err)
 				continue
 			}
 			
 			cards = append(cards, card)
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return cards, fmt.Errorf("error scanning aplay output: %w", err)
 	}
 	
 	return cards, nil
@@ -198,6 +265,10 @@ func getCardDetails(executor *CommandExecutor, cardNumber string) (USBSoundCard,
 				}
 			}
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return card, fmt.Errorf("error scanning udevadm output: %w", err)
 	}
 	
 	// Get vendor/product names from lsusb if we have vendor and product IDs
@@ -261,67 +332,108 @@ func cleanupName(name string) string {
 }
 
 // createUdevRule creates a udev rule to give the sound card a persistent name
-func createUdevRule(card USBSoundCard, config Config) error {
+func createUdevRule(card USBSoundCard, customName string, config Config, logger *Logger) error {
 	// Verify we have the necessary information
 	if card.VendorID == "" || card.ProductID == "" {
 		return fmt.Errorf("insufficient device information for card %s", card.CardNumber)
 	}
+
+	// Use custom name if provided, otherwise use the default
+	deviceName := card.FriendlyName
+	if customName != "" {
+		deviceName = cleanupName(customName)
+	}
 	
-	// Create rule content
-	var ruleContent string
+	// Create rule content - FIX: Using string slice and Join to avoid escape issues
+	var ruleLines []string
 	
 	// Add header
-	ruleContent += "# USB sound card persistent mapping created by usb-soundcard-mapper\n"
-	ruleContent += "# Device: " + card.Vendor + " " + card.Product + "\n"
+	ruleLines = append(ruleLines, "# USB sound card persistent mapping created by usb-soundcard-mapper")
+	ruleLines = append(ruleLines, "# Device: "+card.Vendor+" "+card.Product)
 	
-	// Create the rule
+	// Create the mapping rule - ACTION=="add" critical for reliable application
 	if card.Serial != "" {
 		// If we have a serial number, use it for more reliable mapping
-		ruleContent += fmt.Sprintf(
-			`SUBSYSTEM=="sound", ACTION=="add", ATTRS{idVendor}=="%s", ATTRS{idProduct}=="%s", ATTRS{serial}=="%s", ATTR{id}="%s"\n`,
-			card.VendorID, card.ProductID, card.Serial, card.FriendlyName)
+		ruleLines = append(ruleLines, fmt.Sprintf(
+			`SUBSYSTEM=="sound", ACTION=="add", ATTRS{idVendor}=="%s", ATTRS{idProduct}=="%s", ATTRS{serial}=="%s", ATTR{id}="%s"`,
+			card.VendorID, card.ProductID, card.Serial, deviceName))
 	} else if card.PhysicalPort != "" {
 		// Use physical port for devices without serial numbers
-		ruleContent += fmt.Sprintf(
-			`SUBSYSTEM=="sound", ACTION=="add", ATTRS{idVendor}=="%s", ATTRS{idProduct}=="%s", KERNELS=="%s*", ATTR{id}="%s"\n`,
-			card.VendorID, card.ProductID, card.PhysicalPort, card.FriendlyName)
+		ruleLines = append(ruleLines, fmt.Sprintf(
+			`SUBSYSTEM=="sound", ACTION=="add", ATTRS{idVendor}=="%s", ATTRS{idProduct}=="%s", KERNELS=="%s*", ATTR{id}="%s"`,
+			card.VendorID, card.ProductID, card.PhysicalPort, deviceName))
 	} else {
 		// Fallback to basic vendor/product ID mapping (less reliable)
-		ruleContent += fmt.Sprintf(
-			`SUBSYSTEM=="sound", ACTION=="add", ATTRS{idVendor}=="%s", ATTRS{idProduct}=="%s", ATTR{id}="%s"\n`,
-			card.VendorID, card.ProductID, card.FriendlyName)
+		ruleLines = append(ruleLines, fmt.Sprintf(
+			`SUBSYSTEM=="sound", ACTION=="add", ATTRS{idVendor}=="%s", ATTRS{idProduct}=="%s", ATTR{id}="%s"`,
+			card.VendorID, card.ProductID, deviceName))
 	}
+	
+	// Add additional rule to ensure the name is also set after the system is running
+	if card.Serial != "" {
+		ruleLines = append(ruleLines, fmt.Sprintf(
+			`SUBSYSTEM=="sound", ENV{SOUND_INITIALIZED}=="1", ATTRS{idVendor}=="%s", ATTRS{idProduct}=="%s", ATTRS{serial}=="%s", ATTR{id}="%s"`,
+			card.VendorID, card.ProductID, card.Serial, deviceName))
+	} else if card.PhysicalPort != "" {
+		ruleLines = append(ruleLines, fmt.Sprintf(
+			`SUBSYSTEM=="sound", ENV{SOUND_INITIALIZED}=="1", ATTRS{idVendor}=="%s", ATTRS{idProduct}=="%s", KERNELS=="%s*", ATTR{id}="%s"`,
+			card.VendorID, card.ProductID, card.PhysicalPort, deviceName))
+	} else {
+		ruleLines = append(ruleLines, fmt.Sprintf(
+			`SUBSYSTEM=="sound", ENV{SOUND_INITIALIZED}=="1", ATTRS{idVendor}=="%s", ATTRS{idProduct}=="%s", ATTR{id}="%s"`,
+			card.VendorID, card.ProductID, deviceName))
+	}
+	
+	// Add a symlink rule - using separate rule for clarity
+	ruleLines = append(ruleLines, fmt.Sprintf(
+		`SUBSYSTEM=="sound", ACTION=="add", ATTRS{idVendor}=="%s", ATTRS{idProduct}=="%s", SYMLINK+="sound/by-id/%s"`, 
+		card.VendorID, card.ProductID, deviceName))
+	
+	// Join all lines with proper newlines
+	ruleContent := strings.Join(ruleLines, "\n") + "\n"
 	
 	// Create the rule file path
 	ruleFile := filepath.Join(config.UdevRulesPath, fmt.Sprintf("89-usb-soundcard-%s-%s.rules", 
 		card.VendorID, card.ProductID))
+	
+	// Log the exact file path being used
+	logger.Info("Creating udev rule file at: %s", ruleFile)
 	
 	// Create the directory if it doesn't exist
 	if err := os.MkdirAll(config.UdevRulesPath, 0755); err != nil {
 		return fmt.Errorf("failed to create udev rules directory: %w", err)
 	}
 	
-	// Write the rule to a temporary file first
-	tmpFile, err := ioutil.TempFile("", "udev-rule-*.rules")
+	// Write the rule directly to the file - no more using temporary files to avoid issues
+	err := os.WriteFile(ruleFile, []byte(ruleContent), 0644)
 	if err != nil {
-		return fmt.Errorf("failed to create temporary file: %w", err)
-	}
-	defer os.Remove(tmpFile.Name()) // Clean up in case of failure
-	
-	// Write the content to the temporary file
-	if err := ioutil.WriteFile(tmpFile.Name(), []byte(ruleContent), 0644); err != nil {
-		return fmt.Errorf("failed to write to temporary file: %w", err)
-	}
-	
-	// Move the temporary file to the final location
-	if err := os.Rename(tmpFile.Name(), ruleFile); err != nil {
-		return fmt.Errorf("failed to move rule file to destination: %w", err)
+		return fmt.Errorf("failed to write udev rule file: %w", err)
 	}
 	
 	// Set correct permissions
 	if err := os.Chmod(ruleFile, 0644); err != nil {
 		return fmt.Errorf("failed to set rule file permissions: %w", err)
 	}
+	
+	// Verify the file was actually created with the correct content
+	if contents, err := os.ReadFile(ruleFile); err != nil {
+		return fmt.Errorf("error verifying udev rule file: %w", err)
+	} else {
+		// Log the actual content that was written
+		logger.Debug("Rule file content: %s", string(contents))
+		
+		// Verify content was written properly
+		if !strings.Contains(string(contents), deviceName) {
+			return fmt.Errorf("rule file was created but does not contain the device name: %s", deviceName)
+		}
+		
+		// Verify proper line breaks
+		if !strings.Contains(string(contents), "\nSUBSYSTEM") {
+			logger.Error("Rule file was created but may have formatting issues!")
+		}
+	}
+
+	logger.Info("Created udev rule at %s", ruleFile)
 	
 	return nil
 }
@@ -333,10 +445,16 @@ func reloadUdevRules(executor *CommandExecutor) error {
 		return fmt.Errorf("failed to reload udev rules: %w", err)
 	}
 	
-	// Trigger the rules for all sound devices
-	if _, err := executor.ExecuteCommand("udevadm", "trigger", "--action=change", "--subsystem-match=sound"); err != nil {
+	// Sleep to give udev time to process the rule reloading
+	time.Sleep(1 * time.Second)
+	
+	// Trigger the rules for all sound devices - using add action for more reliable application
+	if _, err := executor.ExecuteCommand("udevadm", "trigger", "--action=add", "--subsystem-match=sound"); err != nil {
 		return fmt.Errorf("failed to trigger udev rules: %w", err)
 	}
+
+	// Sleep again to give udev time to apply the rules
+	time.Sleep(2 * time.Second)
 	
 	return nil
 }
@@ -377,86 +495,514 @@ func (i listItem) FilterValue() string {
 	return i.Title()
 }
 
-// cardSelectorModel holds the state for the device selection UI
-type cardSelectorModel struct {
-	list list.Model
-	err  error
+// UI styling
+var (
+	titleStyle = lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#FAFAFA")).
+		Background(lipgloss.Color("#7D56F4")).
+		Padding(0, 1)
+
+	subtitleStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#FAFAFA")).
+		Background(lipgloss.Color("#43BF6D")).
+		Padding(0, 1)
+
+	activeStyle = lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#43BF6D"))
+
+	inactiveStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#666666"))
+
+	errorStyle = lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#FF0000"))
+
+	docStyle = lipgloss.NewStyle().
+		Margin(1, 2)
+
+	highlightStyle = lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#874BFD"))
+
+	infoStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#43BF6D"))
+)
+
+// UI-related key mappings
+type keyMap struct {
+	Up      key.Binding
+	Down    key.Binding
+	Enter   key.Binding
+	Back    key.Binding
+	Quit    key.Binding
+	Edit    key.Binding
+	Confirm key.Binding
 }
 
-// Init initializes the model and returns initial command
-func (m cardSelectorModel) Init() tea.Cmd {
-	// No initial commands needed for this model
-	return nil
+// Default key mappings
+var keys = keyMap{
+	Up: key.NewBinding(
+		key.WithKeys("up", "k"),
+		key.WithHelp("↑/k", "up"),
+	),
+	Down: key.NewBinding(
+		key.WithKeys("down", "j"),
+		key.WithHelp("↓/j", "down"),
+	),
+	Enter: key.NewBinding(
+		key.WithKeys("enter"),
+		key.WithHelp("enter", "select"),
+	),
+	Back: key.NewBinding(
+		key.WithKeys("esc"),
+		key.WithHelp("esc", "back"),
+	),
+	Quit: key.NewBinding(
+		key.WithKeys("ctrl+c", "q"),
+		key.WithHelp("ctrl+c/q", "quit"),
+	),
+	Edit: key.NewBinding(
+		key.WithKeys("e"),
+		key.WithHelp("e", "edit"),
+	),
+	Confirm: key.NewBinding(
+		key.WithKeys("y"),
+		key.WithHelp("y", "confirm"),
+	),
 }
 
-// Initial model for the card selector
-func initialCardSelectorModel(cards []USBSoundCard) cardSelectorModel {
+// uiModel represents the UI state
+type uiModel struct {
+	cards           []USBSoundCard
+	list            list.Model
+	textInput       textinput.Model
+	state           viewState
+	selectedCard    USBSoundCard
+	customName      string
+	config          Config
+	executor        *CommandExecutor
+	logger          *Logger
+	error           string
+	width           int
+	height          int
+	successMessage  string
+}
+
+// Initialize UI model
+func initialUIModel(cards []USBSoundCard, config Config, executor *CommandExecutor, logger *Logger) uiModel {
+	// Create list items
 	items := make([]list.Item, len(cards))
 	for i, card := range cards {
 		items[i] = listItem{card: card}
 	}
 	
+	// Setup list component
 	l := list.New(items, list.NewDefaultDelegate(), 0, 0)
 	l.Title = "Select USB Sound Card to Map"
+	l.SetFilteringEnabled(false)
+	l.SetShowHelp(true)
+	l.SetShowStatusBar(false)
+	l.SetShowPagination(true)
 	
-	return cardSelectorModel{
-		list: l,
+	// Setup text input component
+	ti := textinput.New()
+	ti.Placeholder = "Enter custom name for the device"
+	ti.CharLimit = 64
+	ti.Width = 40
+	ti.Prompt = "› "
+	
+	return uiModel{
+		cards:     cards,
+		list:      l,
+		textInput: ti,
+		state:     stateCardSelect,
+		config:    config,
+		executor:  executor,
+		logger:    logger,
 	}
 }
 
-// Update the model based on messages
-func (m cardSelectorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+// Initialize the model
+func (m uiModel) Init() tea.Cmd {
+	return nil
+}
+
+// Handle user input and state transitions
+func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+	var cmds []tea.Cmd
+
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		
+		// Update list dimensions
+		h, v := docStyle.GetFrameSize()
+		m.list.SetSize(msg.Width-h, msg.Height-v)
+		
 	case tea.KeyMsg:
-		if msg.String() == "ctrl+c" || msg.String() == "q" {
+		// Global key handlers
+		switch {
+		case key.Matches(msg, keys.Quit):
+			m.logger.Debug("Quitting application")
 			return m, tea.Quit
 		}
 		
-		if msg.String() == "enter" {
-			return m, tea.Quit
+		// State-specific handlers
+		switch m.state {
+		case stateCardSelect:
+			// Handle list navigation and selection
+			switch {
+			case key.Matches(msg, keys.Enter):
+				selectedItem, ok := m.list.SelectedItem().(listItem)
+				if !ok || len(m.cards) == 0 {
+					m.logger.Error("No card selected or no cards available")
+					m.error = "No card selected or no cards available"
+					m.state = stateError
+					return m, nil
+				}
+				
+				m.selectedCard = selectedItem.card
+				m.customName = m.selectedCard.FriendlyName // Pre-populate with suggested name
+				m.textInput.SetValue(m.customName)
+				m.textInput.Focus()
+				m.state = stateNameInput
+				return m, textinput.Blink
+			}
+			
+			// Pass the message to the list component
+			m.list, cmd = m.list.Update(msg)
+			cmds = append(cmds, cmd)
+			
+		case stateNameInput:
+			switch {
+			case key.Matches(msg, keys.Enter):
+				// Validate input
+				customName := m.textInput.Value()
+				if customName == "" {
+					m.error = "Device name cannot be empty"
+					return m, nil
+				}
+				
+				// Clean up and validate the name
+				cleanedName := cleanupName(customName)
+				if cleanedName != customName {
+					m.customName = cleanedName
+					m.textInput.SetValue(cleanedName)
+					return m, nil
+				}
+				
+				m.customName = cleanedName
+				m.state = stateConfirmation
+				return m, nil
+				
+			case key.Matches(msg, keys.Back):
+				// Return to card selection
+				m.textInput.Blur()
+				m.state = stateCardSelect
+				return m, nil
+			}
+			
+			// Pass the message to the text input component
+			m.textInput, cmd = m.textInput.Update(msg)
+			cmds = append(cmds, cmd)
+			
+		case stateConfirmation:
+			switch {
+			case key.Matches(msg, keys.Confirm):
+				// Create udev rule with custom name
+				err := createUdevRule(m.selectedCard, m.customName, m.config, m.logger)
+				if err != nil {
+					m.logger.Error("Failed to create udev rule: %v", err)
+					m.error = fmt.Sprintf("Failed to create udev rule: %v", err)
+					m.state = stateError
+					return m, nil
+				}
+				
+				// Reload udev rules if not skipped
+				if !m.config.SkipReload {
+					err = reloadUdevRules(m.executor)
+					if err != nil {
+						m.logger.Error("Failed to reload udev rules: %v", err)
+						m.error = fmt.Sprintf("Failed to reload udev rules: %v", err)
+						m.state = stateError
+						return m, nil
+					}
+				}
+				
+				// Success message
+				m.successMessage = fmt.Sprintf("Created persistent mapping for %s %s (VID:PID %s:%s) as '%s'\n\n"+
+					"The sound card will use this name consistently across reboots and reconnections.\n"+
+					"You can see this device in 'aplay -l' output as card with ID '%s'\n"+
+					"once you disconnect and reconnect the device.",
+					m.selectedCard.Vendor, m.selectedCard.Product, 
+					m.selectedCard.VendorID, m.selectedCard.ProductID, 
+					m.customName, m.customName)
+				
+				return m, tea.Quit
+				
+			case key.Matches(msg, keys.Back):
+				// Return to name input
+				m.state = stateNameInput
+				return m, textinput.Blink
+			}
+			
+		case stateError:
+			// Return to card selection on any key press
+			m.error = ""
+			m.state = stateCardSelect
+			return m, nil
 		}
-	case tea.WindowSizeMsg:
-		h, v := docStyle.GetFrameSize()
-		m.list.SetSize(msg.Width-h, msg.Height-v)
+	}
+
+	return m, tea.Batch(cmds...)
+}
+
+// Render the UI based on current state
+func (m uiModel) View() string {
+	var sb strings.Builder
+	
+	// Common header
+	sb.WriteString(titleStyle.Render(fmt.Sprintf(" %s v%s ", AppName, AppVersion)) + "\n\n")
+	
+	switch m.state {
+	case stateCardSelect:
+		sb.WriteString(activeStyle.Render("Step 1: Select a USB sound card") + "\n\n")
+		sb.WriteString(m.list.View() + "\n\n")
+		sb.WriteString(inactiveStyle.Render("Step 2: Enter custom name") + "\n")
+		
+	case stateNameInput:
+		sb.WriteString(inactiveStyle.Render("Step 1: Select a USB sound card") + "\n")
+		sb.WriteString(fmt.Sprintf("Selected: %s\n\n", highlightStyle.Render(m.selectedCard.Vendor+" "+m.selectedCard.Product)))
+		sb.WriteString(activeStyle.Render("Step 2: Enter custom name for this device") + "\n\n")
+		sb.WriteString(m.textInput.View() + "\n\n")
+		sb.WriteString("This name will be used to identify the device in ALSA.\n")
+		sb.WriteString("Press Enter to confirm or Esc to go back.\n")
+		
+		if m.error != "" {
+			sb.WriteString("\n" + errorStyle.Render(m.error) + "\n")
+		}
+		
+	case stateConfirmation:
+		sb.WriteString("Please confirm the following configuration:\n\n")
+		sb.WriteString(fmt.Sprintf("Device: %s\n", highlightStyle.Render(m.selectedCard.Vendor+" "+m.selectedCard.Product)))
+		sb.WriteString(fmt.Sprintf("Card Number: %s\n", m.selectedCard.CardNumber))
+		sb.WriteString(fmt.Sprintf("VID:PID: %s:%s\n", m.selectedCard.VendorID, m.selectedCard.ProductID))
+		
+		if m.selectedCard.Serial != "" {
+			sb.WriteString(fmt.Sprintf("Serial: %s\n", m.selectedCard.Serial))
+		}
+		
+		if m.selectedCard.PhysicalPort != "" {
+			sb.WriteString(fmt.Sprintf("Physical Port: %s\n", m.selectedCard.PhysicalPort))
+		}
+		
+		sb.WriteString(fmt.Sprintf("\nCustom Name: %s\n\n", highlightStyle.Render(m.customName)))
+		sb.WriteString("Press 'y' to confirm or Esc to go back.")
+		
+	case stateError:
+		sb.WriteString(errorStyle.Render("Error:") + "\n\n")
+		sb.WriteString(m.error + "\n\n")
+		sb.WriteString("Press any key to return to device selection...")
 	}
 	
-	var cmd tea.Cmd
-	m.list, cmd = m.list.Update(msg)
-	return m, cmd
+	return docStyle.Render(sb.String())
 }
 
-// Render the UI
-func (m cardSelectorModel) View() string {
-	return docStyle.Render(m.list.View())
-}
-
-// Style for the UI
-var docStyle = lipgloss.NewStyle().Margin(1, 2)
-
-// runCardSelector runs the terminal UI for card selection
-func runCardSelector(cards []USBSoundCard) (USBSoundCard, error) {
+// runUI starts the terminal UI for interactive mode
+func runUI(cards []USBSoundCard, config Config, executor *CommandExecutor, logger *Logger) (string, error) {
 	if len(cards) == 0 {
-		return USBSoundCard{}, fmt.Errorf("no USB sound cards found")
+		return "", fmt.Errorf("no USB sound cards found")
 	}
 	
-	p := tea.NewProgram(initialCardSelectorModel(cards))
+	p := tea.NewProgram(initialUIModel(cards, config, executor, logger), tea.WithAltScreen())
 	m, err := p.Run()
 	if err != nil {
-		return USBSoundCard{}, fmt.Errorf("error running UI: %w", err)
+		return "", fmt.Errorf("error running UI: %w", err)
 	}
 	
-	model, ok := m.(cardSelectorModel)
+	model, ok := m.(uiModel)
 	if !ok {
-		return USBSoundCard{}, fmt.Errorf("unexpected model type returned from UI")
+		return "", fmt.Errorf("unexpected model type returned from UI")
 	}
 	
-	// Get the selected card
-	selectedItem, ok := model.list.SelectedItem().(listItem)
-	if !ok {
-		return USBSoundCard{}, fmt.Errorf("no card selected")
+	// Return success message if we have one
+	if model.successMessage != "" {
+		return model.successMessage, nil
 	}
 	
-	return selectedItem.card, nil
+	// If we don't have a success message, the user probably quit early
+	return "", fmt.Errorf("operation cancelled by user")
+}
+
+// setupSignalHandling sets up graceful shutdown on system signals
+func setupSignalHandling(logger *Logger) {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	
+	go func() {
+		<-c
+		logger.Info("Received interrupt signal, shutting down gracefully")
+		os.Exit(0)
+	}()
+}
+
+// FileExists checks if a file exists and is not a directory
+func FileExists(filename string) bool {
+	info, err := os.Stat(filename)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false
+		}
+		return false
+	}
+	return !info.IsDir()
+}
+
+// BackupExistingUdevRules creates a backup of existing rules files
+func BackupExistingUdevRules(cardVendorID, cardProductID string, config Config, logger *Logger) error {
+	// Pattern for rule files we might want to back up
+	patterns := []string{
+		fmt.Sprintf("*usb-soundcard*%s*%s*.rules", cardVendorID, cardProductID),
+		fmt.Sprintf("*usb*sound*%s*%s*.rules", cardVendorID, cardProductID),
+		fmt.Sprintf("*sound*%s*%s*.rules", cardVendorID, cardProductID),
+	}
+
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(filepath.Join(config.UdevRulesPath, pattern))
+		if err != nil {
+			logger.Error("Error searching for existing rules: %v", err)
+			continue
+		}
+
+		for _, match := range matches {
+			// Skip backing up our own rule file
+			if strings.Contains(match, fmt.Sprintf("89-usb-soundcard-%s-%s.rules", cardVendorID, cardProductID)) {
+				continue
+			}
+
+			// Create backup with timestamp
+			backupFile := match + ".bak." + time.Now().Format("20060102150405")
+			logger.Info("Backing up existing rule file %s to %s", match, backupFile)
+
+			content, err := os.ReadFile(match)
+			if err != nil {
+				logger.Error("Failed to read existing rule file %s: %v", match, err)
+				continue
+			}
+
+			err = os.WriteFile(backupFile, content, 0644)
+			if err != nil {
+				logger.Error("Failed to write backup file %s: %v", backupFile, err)
+				continue
+			}
+
+			// Don't delete the original - just leave it as a backup
+		}
+	}
+
+	return nil
+}
+
+// verifyUdevRuleInstallation checks if the rule is properly installed
+func verifyUdevRuleInstallation(card USBSoundCard, customName string, executor *CommandExecutor, logger *Logger) bool {
+	// Check if udev rules were reloaded successfully
+	output, err := executor.ExecuteCommand("udevadm", "info", "--path", fmt.Sprintf("/sys/class/sound/card%s", card.CardNumber))
+	if err != nil {
+		logger.Error("Failed to verify udev rule installation: %v", err)
+		return false
+	}
+
+	// Look for the custom name in the output
+	if strings.Contains(output, fmt.Sprintf("ID_SOUND_ID=%s", customName)) {
+		logger.Info("Verified successful udev rule installation!")
+		return true
+	}
+
+	// If not found, try to trigger the rule specifically for this device
+	logger.Info("Rule verification failed. Trying to trigger rules specifically for this device...")
+	
+	_, err = executor.ExecuteCommand("udevadm", "trigger", "--action=add", 
+		"--property-match=SUBSYSTEM=sound", 
+		fmt.Sprintf("--property-match=ID_VENDOR_ID=%s", card.VendorID),
+		fmt.Sprintf("--property-match=ID_MODEL_ID=%s", card.ProductID))
+	
+	if err != nil {
+		logger.Error("Failed to trigger specific udev rules: %v", err)
+		return false
+	}
+
+	// Give it a moment to apply
+	time.Sleep(2 * time.Second)
+	
+	return true
+}
+
+// Write a test udev rule to verify udev is working properly
+func testUdevSystem(executor *CommandExecutor, logger *Logger) bool {
+	logger.Info("Testing if udev rule system is working properly...")
+	
+	// Create a small test rule
+	testRuleFile := "/etc/udev/rules.d/99-test-usb-soundcard-mapper.rules"
+	testRuleContent := "# Test rule to check if udev is functioning properly\n"
+	
+	// Write test rule
+	err := os.WriteFile(testRuleFile, []byte(testRuleContent), 0644)
+	if err != nil {
+		logger.Error("Failed to write test udev rule: %v", err)
+		return false
+	}
+	
+	// Try to reload udev rules
+	_, err = executor.ExecuteCommand("udevadm", "control", "--reload-rules")
+	if err != nil {
+		logger.Error("Failed to reload udev rules during test: %v", err)
+		os.Remove(testRuleFile) // Clean up
+		return false
+	}
+	
+	// Clean up test rule
+	os.Remove(testRuleFile)
+	
+	logger.Info("Udev system test passed")
+	return true
+}
+
+// checkAndFixPermissions ensures the udev rules directory has the correct permissions
+func checkAndFixPermissions(config Config, logger *Logger) error {
+	// Check if the rules directory exists and has correct permissions
+	info, err := os.Stat(config.UdevRulesPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Create directory with correct permissions
+			err = os.MkdirAll(config.UdevRulesPath, 0755)
+			if err != nil {
+				return fmt.Errorf("failed to create udev rules directory: %w", err)
+			}
+			return nil
+		}
+		return fmt.Errorf("failed to check udev rules directory: %w", err)
+	}
+	
+	// If exists but is not a directory
+	if !info.IsDir() {
+		return fmt.Errorf("%s exists but is not a directory", config.UdevRulesPath)
+	}
+	
+	// Check permissions - should be at least 0755
+	if info.Mode().Perm()&0755 != 0755 {
+		// Try to fix permissions
+		logger.Info("Fixing permissions on %s", config.UdevRulesPath)
+		err = os.Chmod(config.UdevRulesPath, 0755)
+		if err != nil {
+			return fmt.Errorf("failed to set permissions on udev rules directory: %w", err)
+		}
+	}
+	
+	return nil
 }
 
 // main function
@@ -470,21 +1016,59 @@ func main() {
 	flag.StringVar(&config.DeviceName, "name", "", "Custom name for the device (non-interactive mode)")
 	flag.StringVar(&config.VendorID, "vendor-id", "", "Vendor ID (non-interactive mode)")
 	flag.StringVar(&config.ProductID, "product-id", "", "Product ID (non-interactive mode)")
+	flag.BoolVar(&config.Debug, "debug", false, "Enable debug logging")
+	flag.BoolVar(&config.SkipReload, "skip-reload", false, "Skip reloading udev rules after creating them")
+	
+	// Custom usage message
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", AppName)
+		fmt.Fprintf(os.Stderr, "Creates persistent device mappings for USB sound cards.\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  %s --list                  # List all USB sound cards\n", AppName)
+		fmt.Fprintf(os.Stderr, "  %s                         # Interactive mode\n", AppName)
+		fmt.Fprintf(os.Stderr, "  %s --non-interactive --vendor-id 1234 --product-id 5678 --name my_mic\n", AppName)
+	}
 	
 	flag.Parse()
 	
+	// Configure logging
+	logger := NewLogger(config.Debug)
+	logger.Info("Starting %s v%s", AppName, AppVersion)
+	
+	// Setup signal handling for graceful shutdown
+	setupSignalHandling(logger)
+	
 	// Create command executor
-	executor := NewCommandExecutor()
+	executor := NewCommandExecutor(logger)
 	
 	// Check if required commands are available
 	if err := CheckCommands(executor); err != nil {
-		log.Fatalf("Error: %v", err)
+		logger.Error("Command check failed: %v", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	
+	// Check and fix permissions on udev rules directory
+	if err := checkAndFixPermissions(config, logger); err != nil {
+		logger.Error("Permission check failed: %v", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	
+	// Test if udev system is working properly
+	if !testUdevSystem(executor, logger) {
+		logger.Error("Udev system test failed - proceeding anyway but results may be unreliable")
+		fmt.Fprintf(os.Stderr, "Warning: Udev system test failed - rules may not apply correctly\n")
 	}
 	
 	// List all USB sound cards
 	cards, err := GetUSBSoundCards(executor)
 	if err != nil {
-		log.Fatalf("Error: %v", err)
+		logger.Error("Failed to get USB sound cards: %v", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
 	
 	// If list-only mode, just display the cards and exit
@@ -513,20 +1097,26 @@ func main() {
 		return
 	}
 	
-	// Check privileges
+	// Check privileges for creating udev rules
 	elevated, err := checkElevatedPrivileges()
 	if err != nil {
-		log.Fatalf("Error checking privileges: %v", err)
+		logger.Error("Failed to check privileges: %v", err)
+		fmt.Fprintf(os.Stderr, "Error checking privileges: %v\n", err)
+		os.Exit(1)
 	}
 	
 	if !elevated {
-		log.Fatalf("This application requires root privileges to create udev rules.\nPlease run with sudo.")
+		logger.Error("Insufficient privileges")
+		fmt.Fprintf(os.Stderr, "This application requires root privileges to create udev rules.\nPlease run with sudo.\n")
+		os.Exit(1)
 	}
 	
 	// Handle non-interactive mode
 	if config.NonInteractive {
 		if config.VendorID == "" || config.ProductID == "" {
-			log.Fatalf("In non-interactive mode, --vendor-id and --product-id are required")
+			logger.Error("Missing required parameters for non-interactive mode")
+			fmt.Fprintf(os.Stderr, "In non-interactive mode, --vendor-id and --product-id are required\n")
+			os.Exit(1)
 		}
 		
 		// Find the card that matches the vendor and product IDs
@@ -542,56 +1132,98 @@ func main() {
 		}
 		
 		if !found {
-			log.Fatalf("No USB sound card found with VID:PID %s:%s", config.VendorID, config.ProductID)
+			logger.Error("No matching USB sound card found")
+			fmt.Fprintf(os.Stderr, "No USB sound card found with VID:PID %s:%s\n", config.VendorID, config.ProductID)
+			os.Exit(1)
 		}
 		
 		// If a custom name was specified, use it
+		customName := selectedCard.FriendlyName
 		if config.DeviceName != "" {
-			selectedCard.FriendlyName = cleanupName(config.DeviceName)
+			customName = cleanupName(config.DeviceName)
+		}
+		
+		// Backup any existing rules for this device
+		if err := BackupExistingUdevRules(selectedCard.VendorID, selectedCard.ProductID, config, logger); err != nil {
+			logger.Error("Warning: Failed to backup existing rules: %v", err)
+			// Continue anyway - this is not fatal
 		}
 		
 		// Create udev rule
-		if err := createUdevRule(selectedCard, config); err != nil {
-			log.Fatalf("Error creating udev rule: %v", err)
+		if err := createUdevRule(selectedCard, customName, config, logger); err != nil {
+			logger.Error("Failed to create udev rule: %v", err)
+			fmt.Fprintf(os.Stderr, "Error creating udev rule: %v\n", err)
+			os.Exit(1)
 		}
 		
 		// Reload udev rules
-		if err := reloadUdevRules(executor); err != nil {
-			log.Fatalf("Error reloading udev rules: %v", err)
+		if !config.SkipReload {
+			if err := reloadUdevRules(executor); err != nil {
+				logger.Error("Failed to reload udev rules: %v", err)
+				fmt.Fprintf(os.Stderr, "Error reloading udev rules: %v\n", err)
+				os.Exit(1)
+			}
+			
+			// Verify the rule installation
+			verifyUdevRuleInstallation(selectedCard, customName, executor, logger)
 		}
 		
 		fmt.Printf("Created persistent mapping for %s %s (VID:PID %s:%s) as '%s'\n",
 			selectedCard.Vendor, selectedCard.Product, selectedCard.VendorID, 
-			selectedCard.ProductID, selectedCard.FriendlyName)
+			selectedCard.ProductID, customName)
+			
+		fmt.Println("\nImportant: For the changes to take full effect, please:")
+		fmt.Println("1. Disconnect and reconnect the USB sound device, or")
+		fmt.Println("2. Reboot your system")
+		
+		// This is critical for reliable rule application - tell the user to run this specific command
+		fmt.Println("\nFor immediate application of rules without rebooting, run:")
+		fmt.Printf("sudo udevadm control --reload-rules && sudo udevadm trigger --action=add --subsystem-match=sound\n")
+		
 		return
 	}
 	
 	// Interactive mode - run the terminal UI
 	if len(cards) == 0 {
-		log.Fatalf("No USB sound cards found.")
+		logger.Error("No USB sound cards found")
+		fmt.Fprintf(os.Stderr, "No USB sound cards found.\n")
+		os.Exit(1)
 	}
 	
-	// Select a card
-	selectedCard, err := runCardSelector(cards)
+	// Backup existing rules for found cards
+	for _, card := range cards {
+		if err := BackupExistingUdevRules(card.VendorID, card.ProductID, config, logger); err != nil {
+			logger.Error("Warning: Failed to backup existing rules for card %s: %v", card.CardNumber, err)
+			// Continue anyway - this is not fatal
+		}
+	}
+	
+	// Run the UI and get the result
+	result, err := runUI(cards, config, executor, logger)
 	if err != nil {
-		log.Fatalf("Error selecting card: %v", err)
+		logger.Error("UI error: %v", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
 	
-	// Create udev rule
-	if err := createUdevRule(selectedCard, config); err != nil {
-		log.Fatalf("Error creating udev rule: %v", err)
+	// Display the result
+	fmt.Println(result)
+	
+	// Print the location of the udev rule for confirmation
+	if !strings.Contains(result, "operation cancelled") {
+		fmt.Printf("\nRule file created at: %s\n", filepath.Join(config.UdevRulesPath, 
+			fmt.Sprintf("89-usb-soundcard-%s-%s.rules", 
+				strings.Split(result, "(VID:PID ")[1][:4], 
+				strings.Split(result, "(VID:PID ")[1][5:9])))
+		fmt.Println("\nTo verify the rule file exists, run:")
+		fmt.Printf("sudo ls -l %s\n", config.UdevRulesPath)
+		
+		fmt.Println("\nImportant: For the changes to take full effect, please:")
+		fmt.Println("1. Disconnect and reconnect the USB sound device, or")
+		fmt.Println("2. Reboot your system")
+		
+		// This is critical for reliable rule application - tell the user to run this specific command
+		fmt.Println("\nFor immediate application of rules without rebooting, run:")
+		fmt.Printf("sudo udevadm control --reload-rules && sudo udevadm trigger --action=add --subsystem-match=sound\n")
 	}
-	
-	// Reload udev rules
-	if err := reloadUdevRules(executor); err != nil {
-		log.Fatalf("Error reloading udev rules: %v", err)
-	}
-	
-	fmt.Printf("Created persistent mapping for %s %s (VID:PID %s:%s) as '%s'\n",
-		selectedCard.Vendor, selectedCard.Product, selectedCard.VendorID, 
-		selectedCard.ProductID, selectedCard.FriendlyName)
-	
-	fmt.Println("\nThe sound card will use this name consistently across reboots and reconnections.")
-	fmt.Println("You can see this device in 'aplay -l' output as card with ID '" + selectedCard.FriendlyName + "'")
-	fmt.Println("once you disconnect and reconnect the device.")
 }
