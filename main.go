@@ -1,6 +1,6 @@
 // USB Soundcard Mapper
 // A robust utility for creating persistent udev mappings for USB audio devices
-// Version: 2.0.1 (based on v2.0.0 with production readiness improvements)
+// Version: 2.0.2 (production hardening release)
 
 package main
 
@@ -34,10 +34,23 @@ import (
 
 // Application constants
 const (
-	AppName      = "usb-soundcard-mapper"
-	AppVersion   = "2.0.1"
-	ExecTimeout  = 5 * time.Second
-	udevRulesDir = "/etc/udev/rules.d"
+	AppName         = "usb-soundcard-mapper"
+	AppVersion      = "2.0.2"
+	ExecTimeout     = 5 * time.Second
+	udevRulesDir    = "/etc/udev/rules.d"
+	maxBackupCount  = 10  // Maximum number of backups to keep per device
+	maxQueueSize    = 100 // Maximum size of operation queues
+	maxFileSize     = 1024 * 1024 // 1MB maximum file size for safety
+	gracefulTimeout = 5 * time.Second // Timeout for graceful shutdown
+)
+
+// Pre-compiled regular expressions for improved performance and safety
+var (
+	vendorIDRegex  = regexp.MustCompile(`^[0-9a-fA-F]{4}$`)
+	productIDRegex = regexp.MustCompile(`^[0-9a-fA-F]{4}$`)
+	serialRegex    = regexp.MustCompile(`^[^<>|&;()$\r\n\t\0]+$`)
+	fileNameRegex  = regexp.MustCompile(`^[a-zA-Z0-9_\-\.]+$`)
+	pathSafeRegex  = regexp.MustCompile(`^[a-zA-Z0-9_\-\.\/]+$`)
 )
 
 // ConfigurableTimeouts holds configurable timeout values
@@ -46,6 +59,8 @@ type ConfigurableTimeouts struct {
 	RuleReloadWait    time.Duration
 	TriggerActionWait time.Duration
 	RetryInterval     time.Duration
+	GracefulShutdown  time.Duration
+	LockAcquisition   time.Duration
 }
 
 // DefaultTimeouts provides default values for timeouts
@@ -54,6 +69,8 @@ var DefaultTimeouts = ConfigurableTimeouts{
 	RuleReloadWait:    1 * time.Second,
 	TriggerActionWait: 2 * time.Second,
 	RetryInterval:     500 * time.Millisecond,
+	GracefulShutdown:  5 * time.Second,
+	LockAcquisition:   2 * time.Second,
 }
 
 // Sentinel errors for specific failure cases
@@ -69,6 +86,10 @@ var (
 	ErrFileLockFailed       = errors.New("failed to acquire file lock")
 	ErrRuleVerificationFail = errors.New("rule verification failed")
 	ErrVirtualDevice        = errors.New("virtual audio device detected")
+	ErrResourceExhausted    = errors.New("resource limits exhausted")
+	ErrInvalidPath          = errors.New("invalid path provided")
+	ErrTransactionFailed    = errors.New("transaction failed, rollback completed")
+	ErrUnsafeArgument       = errors.New("unsafe command argument detected")
 )
 
 // LogLevel represents the logging verbosity level
@@ -99,6 +120,16 @@ type Config struct {
 	MaxRetries      int
 	ForceOverwrite  bool
 	IgnoreVirtual   bool
+	MaxBackupCount  int
+	ResourceLimits  ResourceLimits
+}
+
+// ResourceLimits defines limits to prevent resource exhaustion
+type ResourceLimits struct {
+	MaxConcurrentOps   int
+	MaxQueueSize       int
+	MaxFileSize        int64
+	MaxBackupsPerDevice int
 }
 
 // ConcurrencyOptions configures the concurrency behavior
@@ -168,19 +199,16 @@ func (c *USBSoundCard) Validate() error {
 	}
 	
 	// Validate VendorID and ProductID format (should be 4 hex digits)
-	vidRegex := regexp.MustCompile(`^[0-9a-fA-F]{4}$`)
-	if !vidRegex.MatchString(c.VendorID) {
+	if !vendorIDRegex.MatchString(c.VendorID) {
 		return fmt.Errorf("invalid vendor ID format: %s", c.VendorID)
 	}
 	
-	pidRegex := regexp.MustCompile(`^[0-9a-fA-F]{4}$`)
-	if !pidRegex.MatchString(c.ProductID) {
+	if !productIDRegex.MatchString(c.ProductID) {
 		return fmt.Errorf("invalid product ID format: %s", c.ProductID)
 	}
 	
 	// Validate Serial if present (should not contain control characters or shell special chars)
 	if c.Serial != "" {
-		serialRegex := regexp.MustCompile(`^[^<>|&;()$\r\n\t\0]+$`)
 		if !serialRegex.MatchString(c.Serial) {
 			return fmt.Errorf("invalid serial number format: %s", c.Serial)
 		}
@@ -189,25 +217,124 @@ func (c *USBSoundCard) Validate() error {
 	return nil
 }
 
+// ResourceTracker tracks and manages resources to ensure proper cleanup
+type ResourceTracker struct {
+	resources map[string]func() error
+	mu        sync.Mutex
+	wg        sync.WaitGroup
+}
+
+// NewResourceTracker creates a new resource tracker
+func NewResourceTracker() *ResourceTracker {
+	return &ResourceTracker{
+		resources: make(map[string]func() error),
+	}
+}
+
+// AddResource adds a resource with cleanup function
+func (rt *ResourceTracker) AddResource(id string, cleanup func() error) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	
+	rt.resources[id] = cleanup
+}
+
+// ReleaseResource releases a specific resource
+func (rt *ResourceTracker) ReleaseResource(id string) error {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	
+	if cleanup, exists := rt.resources[id]; exists {
+		err := cleanup()
+		delete(rt.resources, id)
+		return err
+	}
+	
+	return nil
+}
+
+// CleanupAll releases all tracked resources
+func (rt *ResourceTracker) CleanupAll() []error {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	
+	var errors []error
+	for id, cleanup := range rt.resources {
+		if err := cleanup(); err != nil {
+			errors = append(errors, fmt.Errorf("failed to clean up resource %s: %w", id, err))
+		}
+		delete(rt.resources, id)
+	}
+	
+	return errors
+}
+
+// WaitForCompletion waits for all background tasks to complete
+func (rt *ResourceTracker) WaitForCompletion(timeout time.Duration) error {
+	done := make(chan struct{})
+	
+	go func() {
+		rt.wg.Wait()
+		close(done)
+	}()
+	
+	select {
+	case <-done:
+		return nil
+	case <-time.After(timeout):
+		return fmt.Errorf("timed out waiting for resource cleanup")
+	}
+}
+
 // WithCommandExecutor runs a system command safely with retries
 type CommandExecutor struct {
 	DefaultTimeout time.Duration
 	MaxRetries     int
 	RetryInterval  time.Duration
+	ResourceTracker *ResourceTracker
 }
 
 // NewCommandExecutor creates a new command executor
-func NewCommandExecutor(config Config) *CommandExecutor {
+func NewCommandExecutor(config Config, resourceTracker *ResourceTracker) *CommandExecutor {
 	return &CommandExecutor{
-		DefaultTimeout: config.Timeouts.CommandExecution,
-		MaxRetries:     config.MaxRetries,
-		RetryInterval:  config.Timeouts.RetryInterval,
+		DefaultTimeout:  config.Timeouts.CommandExecution,
+		MaxRetries:      config.MaxRetries,
+		RetryInterval:   config.Timeouts.RetryInterval,
+		ResourceTracker: resourceTracker,
 	}
 }
 
 // ExecuteCommand executes a command with the default timeout and retries
 func (ce *CommandExecutor) ExecuteCommand(ctx context.Context, command string, args ...string) (string, error) {
+	// Validate command and arguments for safety
+	if err := validateCommandArgs(command, args...); err != nil {
+		return "", err
+	}
+	
 	return ce.ExecuteCommandWithTimeoutAndRetry(ctx, ce.DefaultTimeout, ce.MaxRetries, command, args...)
+}
+
+// validateCommandArgs checks command and arguments for safety
+func validateCommandArgs(command string, args ...string) error {
+	// Check command
+	if !fileNameRegex.MatchString(command) {
+		return fmt.Errorf("unsafe command name: %s: %w", command, ErrUnsafeArgument)
+	}
+	
+	// Check each argument
+	for i, arg := range args {
+		// For path arguments, use a more restrictive check
+		if strings.HasPrefix(arg, "/") || strings.HasPrefix(arg, "./") || strings.HasPrefix(arg, "../") {
+			if !pathSafeRegex.MatchString(arg) {
+				return fmt.Errorf("unsafe path argument at position %d: %s: %w", i, arg, ErrUnsafeArgument)
+			}
+		} else if strings.Contains(arg, "&&") || strings.Contains(arg, "||") || 
+			strings.Contains(arg, ";") || strings.Contains(arg, "`") {
+			return fmt.Errorf("potentially unsafe argument at position %d: %s: %w", i, arg, ErrUnsafeArgument)
+		}
+	}
+	
+	return nil
 }
 
 // ExecuteCommandWithTimeoutAndRetry executes a command with specific timeout and retries
@@ -224,6 +351,9 @@ func (ce *CommandExecutor) ExecuteCommandWithTimeoutAndRetry(
 		retryCount int
 	)
 	
+	// Generate a unique ID for tracking this command execution
+	cmdID := fmt.Sprintf("cmd_%s_%d", command, time.Now().UnixNano())
+	
 	for retryCount = 0; retryCount <= maxRetries; retryCount++ {
 		// Check if context is already canceled
 		if ctx.Err() != nil {
@@ -231,12 +361,13 @@ func (ce *CommandExecutor) ExecuteCommandWithTimeoutAndRetry(
 		}
 		
 		// Execute the command
-		output, err = ce.executeCommandOnce(ctx, timeout, command, args...)
+		output, err = ce.executeCommandOnce(ctx, timeout, cmdID, command, args...)
 		
 		// If successful or not retryable error, return immediately
 		if err == nil || 
 		   errors.Is(err, ErrCommandNotFound) || 
-		   errors.Is(err, context.DeadlineExceeded) {
+		   errors.Is(err, context.DeadlineExceeded) ||
+		   errors.Is(err, ErrUnsafeArgument) {
 			return output, err
 		}
 		
@@ -266,6 +397,7 @@ func (ce *CommandExecutor) ExecuteCommandWithTimeoutAndRetry(
 func (ce *CommandExecutor) executeCommandOnce(
 	ctx context.Context, 
 	timeout time.Duration, 
+	cmdID string,
 	command string, 
 	args ...string,
 ) (string, error) {
@@ -276,11 +408,18 @@ func (ce *CommandExecutor) executeCommandOnce(
 
 	// Create a context with timeout
 	execCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
+	
+	// Register cleanup in ResourceTracker
+	ce.ResourceTracker.AddResource(cmdID, func() error {
+		cancel()
+		return nil
+	})
+	
 	// Find the full path to the command to avoid shell injection
 	cmdPath, err := exec.LookPath(command)
 	if err != nil {
+		// Clean up the context
+		ce.ResourceTracker.ReleaseResource(cmdID)
 		return "", fmt.Errorf("command not found %s: %w", command, ErrCommandNotFound)
 	}
 
@@ -291,7 +430,24 @@ func (ce *CommandExecutor) executeCommandOnce(
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
+	// Register process cleanup
+	processID := fmt.Sprintf("process_%s_%d", command, time.Now().UnixNano())
+	ce.ResourceTracker.AddResource(processID, func() error {
+		// If the process is still running, terminate it
+		if cmd.Process != nil {
+			err := cmd.Process.Kill()
+			if err != nil && !strings.Contains(err.Error(), "process already finished") {
+				return fmt.Errorf("failed to kill process: %w", err)
+			}
+		}
+		return nil
+	})
+
 	err = cmd.Run()
+	
+	// Clean up resources
+	ce.ResourceTracker.ReleaseResource(cmdID)
+	ce.ResourceTracker.ReleaseResource(processID)
 	
 	// Check for timeout
 	if execCtx.Err() == context.DeadlineExceeded {
@@ -330,21 +486,109 @@ func CheckCommands(ctx context.Context, executor *CommandExecutor) error {
 	return nil
 }
 
+// Transaction represents an atomic operation with rollback capability
+type Transaction struct {
+	operations []func() error
+	rollbacks  []func() error
+	committed  bool
+	mu         sync.Mutex
+}
+
+// NewTransaction creates a new transaction
+func NewTransaction() *Transaction {
+	return &Transaction{
+		operations: make([]func() error, 0),
+		rollbacks:  make([]func() error, 0),
+		committed:  false,
+	}
+}
+
+// AddOperation adds an operation and its rollback function to the transaction
+func (t *Transaction) AddOperation(operation, rollback func() error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	
+	t.operations = append(t.operations, operation)
+	t.rollbacks = append(t.rollbacks, rollback)
+}
+
+// Execute executes all operations in the transaction
+func (t *Transaction) Execute() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	
+	// Execute each operation
+	for i, operation := range t.operations {
+		if err := operation(); err != nil {
+			// If an operation fails, roll back all previous operations
+			slog.Error("Transaction operation failed, rolling back", "error", err, "operation", i)
+			
+			// Execute rollbacks in reverse order
+			for j := i - 1; j >= 0; j-- {
+				if rollbackErr := t.rollbacks[j](); rollbackErr != nil {
+					slog.Error("Rollback failed", "error", rollbackErr, "operation", j)
+				}
+			}
+			
+			return fmt.Errorf("transaction failed at operation %d: %w", i, err)
+		}
+	}
+	
+	t.committed = true
+	return nil
+}
+
+// Commit marks the transaction as committed
+func (t *Transaction) Commit() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	
+	t.committed = true
+}
+
+// Rollback executes all rollback functions in reverse order
+func (t *Transaction) Rollback() []error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	
+	if t.committed {
+		return nil
+	}
+	
+	var errors []error
+	
+	// Execute rollbacks in reverse order
+	for i := len(t.rollbacks) - 1; i >= 0; i-- {
+		if err := t.rollbacks[i](); err != nil {
+			errors = append(errors, fmt.Errorf("rollback %d failed: %w", i, err))
+		}
+	}
+	
+	return errors
+}
+
 // SafeFileAccess ensures thread-safe file operations
 type SafeFileAccess struct {
 	lockMap map[string]*flock.Flock
 	mu      sync.Mutex
+	tracker *ResourceTracker
 }
 
 // NewSafeFileAccess creates a new file access manager
-func NewSafeFileAccess() *SafeFileAccess {
+func NewSafeFileAccess(tracker *ResourceTracker) *SafeFileAccess {
 	return &SafeFileAccess{
 		lockMap: make(map[string]*flock.Flock),
+		tracker: tracker,
 	}
 }
 
-// LockFile acquires a lock on a file
-func (sfa *SafeFileAccess) LockFile(filePath string) (*flock.Flock, error) {
+// LockFile acquires a lock on a file with timeout
+func (sfa *SafeFileAccess) LockFile(filePath string, timeout time.Duration) (*flock.Flock, error) {
+	// Validate the path for safety
+	if !pathSafeRegex.MatchString(filePath) {
+		return nil, fmt.Errorf("unsafe file path: %s: %w", filePath, ErrInvalidPath)
+	}
+	
 	sfa.mu.Lock()
 	defer sfa.mu.Unlock()
 	
@@ -359,12 +603,30 @@ func (sfa *SafeFileAccess) LockFile(filePath string) (*flock.Flock, error) {
 		sfa.lockMap[absPath] = lock
 	}
 	
-	locked, err := lock.TryLock()
+	// Try to acquire the lock with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	
+	// Create resource ID for tracking
+	lockID := fmt.Sprintf("filelock_%s", absPath)
+	
+	// Register with resource tracker
+	sfa.tracker.AddResource(lockID, func() error {
+		// Release the lock if we have it
+		if lock.Locked() {
+			return lock.Unlock()
+		}
+		return nil
+	})
+	
+	success, err := lock.TryLockContext(ctx, 100*time.Millisecond)
 	if err != nil {
+		sfa.tracker.ReleaseResource(lockID)
 		return nil, fmt.Errorf("failed to acquire lock: %w", err)
 	}
 	
-	if !locked {
+	if !success {
+		sfa.tracker.ReleaseResource(lockID)
 		return nil, ErrFileLockFailed
 	}
 	
@@ -373,6 +635,11 @@ func (sfa *SafeFileAccess) LockFile(filePath string) (*flock.Flock, error) {
 
 // UnlockFile releases a lock on a file
 func (sfa *SafeFileAccess) UnlockFile(filePath string) error {
+	// Validate the path for safety
+	if !pathSafeRegex.MatchString(filePath) {
+		return fmt.Errorf("unsafe file path: %s: %w", filePath, ErrInvalidPath)
+	}
+	
 	sfa.mu.Lock()
 	defer sfa.mu.Unlock()
 	
@@ -392,6 +659,11 @@ func (sfa *SafeFileAccess) UnlockFile(filePath string) error {
 	}
 	
 	delete(sfa.lockMap, absPath)
+	
+	// Release from resource tracker
+	lockID := fmt.Sprintf("filelock_%s", absPath)
+	sfa.tracker.ReleaseResource(lockID)
+	
 	return nil
 }
 
@@ -401,10 +673,16 @@ func (sfa *SafeFileAccess) CleanupAllLocks() {
 	defer sfa.mu.Unlock()
 	
 	for path, lock := range sfa.lockMap {
-		err := lock.Unlock()
-		if err != nil {
-			slog.Error("Failed to release lock during cleanup", 
-				"path", path, "error", err)
+		if lock.Locked() {
+			err := lock.Unlock()
+			if err != nil {
+				slog.Error("Failed to release lock during cleanup", 
+					"path", path, "error", err)
+			}
+			
+			// Release from resource tracker
+			lockID := fmt.Sprintf("filelock_%s", path)
+			sfa.tracker.ReleaseResource(lockID)
 		}
 	}
 	
@@ -414,14 +692,16 @@ func (sfa *SafeFileAccess) CleanupAllLocks() {
 
 // DeviceRegistry manages a thread-safe collection of sound cards
 type DeviceRegistry struct {
-	devices map[string]USBSoundCard
-	mu      sync.RWMutex
+	devices      map[string]USBSoundCard
+	deviceKeys   map[USBSoundCard]string // Reverse mapping for consistent key generation
+	mu           sync.RWMutex
 }
 
 // NewDeviceRegistry creates a new device registry
 func NewDeviceRegistry() *DeviceRegistry {
 	return &DeviceRegistry{
-		devices: make(map[string]USBSoundCard),
+		devices:    make(map[string]USBSoundCard),
+		deviceKeys: make(map[USBSoundCard]string),
 	}
 }
 
@@ -430,9 +710,10 @@ func (dr *DeviceRegistry) AddDevice(card USBSoundCard) {
 	dr.mu.Lock()
 	defer dr.mu.Unlock()
 	
-	key := generateDeviceKey(card)
+	key := dr.generateDeviceKey(card)
 	card.Detected = time.Now()
 	dr.devices[key] = card
+	dr.deviceKeys[card] = key
 }
 
 // GetDevices returns all devices in the registry
@@ -448,12 +729,17 @@ func (dr *DeviceRegistry) GetDevices() []USBSoundCard {
 	return devices
 }
 
-// GetDevice retrieves a specific device by key
+// GetDevice retrieves a specific device by card
 func (dr *DeviceRegistry) GetDevice(card USBSoundCard) (USBSoundCard, bool) {
 	dr.mu.RLock()
 	defer dr.mu.RUnlock()
 	
-	key := generateDeviceKey(card)
+	key, exists := dr.deviceKeys[card]
+	if !exists {
+		// Fall back to generated key if not found in the cache
+		key = dr.generateDeviceKey(card)
+	}
+	
 	device, exists := dr.devices[key]
 	return device, exists
 }
@@ -463,7 +749,12 @@ func (dr *DeviceRegistry) UpdateDeviceStatus(card USBSoundCard, status DeviceSta
 	dr.mu.Lock()
 	defer dr.mu.Unlock()
 	
-	key := generateDeviceKey(card)
+	key, exists := dr.deviceKeys[card]
+	if !exists {
+		// Fall back to generated key if not found in the cache
+		key = dr.generateDeviceKey(card)
+	}
+	
 	if device, exists := dr.devices[key]; exists {
 		device.Status = status
 		dr.devices[key] = device
@@ -471,13 +762,15 @@ func (dr *DeviceRegistry) UpdateDeviceStatus(card USBSoundCard, status DeviceSta
 }
 
 // generateDeviceKey creates a unique key for a device
-func generateDeviceKey(card USBSoundCard) string {
+func (dr *DeviceRegistry) generateDeviceKey(card USBSoundCard) string {
 	if card.Serial != "" && !strings.Contains(card.Serial, ":") {
 		return fmt.Sprintf("%s:%s:%s", card.VendorID, card.ProductID, card.Serial)
 	} else if card.PhysicalPort != "" {
 		return fmt.Sprintf("%s:%s:%s", card.VendorID, card.ProductID, card.PhysicalPort)
 	}
-	return fmt.Sprintf("%s:%s", card.VendorID, card.ProductID)
+	
+	// Add card number as fallback to reduce collision risk
+	return fmt.Sprintf("%s:%s:%s", card.VendorID, card.ProductID, card.CardNumber)
 }
 
 // GetUSBSoundCards detects all USB sound cards in the system
@@ -516,8 +809,17 @@ func GetUSBSoundCards(ctx context.Context, executor *CommandExecutor, config Con
 		}
 	}
 	
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error scanning aplay output: %w", err)
+	}
+	
 	// Process each card sequentially to avoid race conditions
 	for _, cardNum := range cardNumbers {
+		// Check if context is canceled
+		if ctx.Err() != nil {
+			return cards, ctx.Err()
+		}
+		
 		// Get more details about this card
 		card, err := getCardDetails(ctx, executor, cardNum, config)
 		if err != nil {
@@ -539,10 +841,6 @@ func GetUSBSoundCards(ctx context.Context, executor *CommandExecutor, config Con
 		
 		cards = append(cards, card)
 		registry.AddDevice(card)
-	}
-	
-	if err := scanner.Err(); err != nil {
-		return cards, fmt.Errorf("error scanning aplay output: %w", err)
 	}
 	
 	// If no cards found but no errors, return specific "no cards" error
@@ -661,7 +959,7 @@ func getCardDetails(ctx context.Context, executor *CommandExecutor, cardNumber s
 	}
 	
 	// Get vendor/product names from lsusb if we have vendor and product IDs
-	if card.VendorID != "" && card.ProductID != "" {
+	if card.VendorID != "" && card.ProductID != "" && ctx.Err() == nil {
 		lsusbOutput, err := executor.ExecuteCommand(ctx, "lsusb", "-d", fmt.Sprintf("%s:%s", card.VendorID, card.ProductID))
 		if err == nil && len(lsusbOutput) > 0 {
 			// Extract vendor and product names from lsusb output
@@ -716,7 +1014,6 @@ func getCardDetails(ctx context.Context, executor *CommandExecutor, cardNumber s
 // sanitizeSerial sanitizes a serial number to prevent security issues
 func sanitizeSerial(serial string) string {
 	// Remove any control characters or shell special chars
-	serialRegex := regexp.MustCompile(`[<>|&;()$\r\n\t\0]`)
 	return serialRegex.ReplaceAllString(serial, "_")
 }
 
@@ -767,6 +1064,11 @@ type UdevRule struct {
 
 // createUdevRule creates a udev rule to give the sound card a persistent name
 func createUdevRule(ctx context.Context, card USBSoundCard, customName string, config Config) (*UdevRule, error) {
+	// Check if context is canceled
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	
 	// Verify we have the necessary information
 	if card.VendorID == "" || card.ProductID == "" {
 		return nil, fmt.Errorf("insufficient device information for card %s", card.CardNumber)
@@ -880,7 +1182,7 @@ func createUdevRule(ctx context.Context, card USBSoundCard, customName string, c
 	return rule, nil
 }
 
-// installUdevRule writes the rule to the filesystem
+// installUdevRule writes the rule to the filesystem using transactions
 func installUdevRule(ctx context.Context, rule *UdevRule, config Config, fileAccess *SafeFileAccess) error {
 	slog.Info("Installing udev rule", 
 		"device", rule.Card.String(),
@@ -894,54 +1196,134 @@ func installUdevRule(ctx context.Context, rule *UdevRule, config Config, fileAcc
 		return nil
 	}
 	
-	// Create the directory if it doesn't exist
-	if err := os.MkdirAll(config.UdevRulesPath, 0755); err != nil {
-		return fmt.Errorf("failed to create udev rules directory: %w", err)
+	// Create a transaction for the entire installation process
+	transaction := NewTransaction()
+	
+	// Add directory creation to transaction
+	transaction.AddOperation(
+		// Create directory operation
+		func() error {
+			return os.MkdirAll(config.UdevRulesPath, 0755)
+		},
+		// Rollback is not needed - directory creation is idempotent
+		func() error { return nil },
+	)
+	
+	// Check if file exists and backup is needed
+	exists, err := fileExists(rule.Path)
+	if err != nil {
+		return fmt.Errorf("error checking if rule file exists: %w", err)
 	}
 	
-	// Check if file exists and we're not forcing overwrite
-	if !config.ForceOverwrite {
-		exists, err := fileExists(rule.Path)
-		if err != nil {
-			slog.Warn("Error checking if rule file exists", "path", rule.Path, "error", err)
-		} else if exists {
-			// Only overwrite if content is different
-			content, err := os.ReadFile(rule.Path)
-			if err == nil && string(content) == rule.Content {
-				slog.Info("Rule file already exists with identical content, skipping write", "path", rule.Path)
+	var backupPath string
+	if exists && config.BackupRules {
+		backupPath = rule.Path + ".bak." + time.Now().Format("20060102150405")
+		
+		// Add backup operation to transaction
+		transaction.AddOperation(
+			// Backup operation
+			func() error {
+				content, err := os.ReadFile(rule.Path)
+				if err != nil {
+					return fmt.Errorf("failed to read existing rule file: %w", err)
+				}
+				
+				// Use atomic write for backup
+				return atomicWriteFile(backupPath, content, 0644, fileAccess, config.Timeouts.LockAcquisition)
+			},
+			// Rollback - remove the backup if needed
+			func() error {
+				if backupPath != "" {
+					if exists, _ := fileExists(backupPath); exists {
+						return os.Remove(backupPath)
+					}
+				}
 				return nil
-			}
+			},
+		)
+	}
+	
+	// Only write if content is different or force overwrite is enabled
+	shouldWrite := true
+	if exists && !config.ForceOverwrite {
+		content, err := os.ReadFile(rule.Path)
+		if err == nil && string(content) == rule.Content {
+			shouldWrite = false
+			slog.Info("Rule file already exists with identical content, skipping write", "path", rule.Path)
 		}
 	}
 	
-	// Use atomic write to avoid race conditions
-	if err := atomicWriteFile(rule.Path, []byte(rule.Content), 0644, fileAccess); err != nil {
-		return fmt.Errorf("failed to write udev rule file: %w", err)
+	// Add rule writing to transaction
+	if shouldWrite {
+		transaction.AddOperation(
+			// Write rule operation
+			func() error {
+				// Use atomic write to avoid race conditions
+				return atomicWriteFile(rule.Path, []byte(rule.Content), 0644, fileAccess, config.Timeouts.LockAcquisition)
+			},
+			// Rollback - restore from backup or remove if new
+			func() error {
+				if backupPath != "" && exists {
+					// Restore from backup
+					content, err := os.ReadFile(backupPath)
+					if err != nil {
+						return fmt.Errorf("failed to read backup for rollback: %w", err)
+					}
+					
+					return atomicWriteFile(rule.Path, content, 0644, fileAccess, config.Timeouts.LockAcquisition)
+				} else if !exists {
+					// Remove the newly created file
+					return os.Remove(rule.Path)
+				}
+				return nil
+			},
+		)
 	}
 	
-	// Create modprobe configuration for better compatibility
-	if err := createModprobeConfig(rule.Card, config, fileAccess); err != nil {
-		// This is non-fatal
-		slog.Warn("Failed to create modprobe configuration", "error", err)
+	// Add modprobe configuration creation to transaction
+	transaction.AddOperation(
+		// Create modprobe config operation
+		func() error {
+			return createModprobeConfig(rule.Card, config, fileAccess)
+		},
+		// Rollback not needed for modprobe config - it's non-critical
+		func() error { return nil },
+	)
+	
+	// Execute the transaction
+	if err := transaction.Execute(); err != nil {
+		slog.Error("Installation transaction failed", "error", err)
+		return fmt.Errorf("installation failed: %w", ErrTransactionFailed)
 	}
 	
+	// Commit the transaction
+	transaction.Commit()
 	return nil
 }
 
 // atomicWriteFile writes a file atomically using a temporary file and rename
-func atomicWriteFile(filename string, data []byte, perm fs.FileMode, fileAccess *SafeFileAccess) error {
+func atomicWriteFile(filename string, data []byte, perm fs.FileMode, fileAccess *SafeFileAccess, lockTimeout time.Duration) error {
+	// Validate the path for safety
+	if !pathSafeRegex.MatchString(filename) {
+		return fmt.Errorf("unsafe file path: %s: %w", filename, ErrInvalidPath)
+	}
+	
+	// Check file size limits
+	if int64(len(data)) > maxFileSize {
+		return fmt.Errorf("file size exceeds maximum allowed size (%d bytes): %w", 
+			maxFileSize, ErrResourceExhausted)
+	}
+	
 	dir := filepath.Dir(filename)
 	
 	// Acquire a lock on the target file
-	_, err := fileAccess.LockFile(filename)
+	_, err := fileAccess.LockFile(filename, lockTimeout)
 	if err != nil {
-		// If lock fails, log but continue with a warning
-		slog.Warn("Failed to acquire lock on file, continuing with caution", 
-			"path", filename, "error", err)
-	} else {
-		// Ensure we release the lock when done
-		defer fileAccess.UnlockFile(filename)
+		return fmt.Errorf("failed to acquire lock on file: %w", err)
 	}
+	
+	// Ensure we release the lock when done - this is critical
+	defer fileAccess.UnlockFile(filename)
 	
 	// Create a temporary file in the same directory
 	tempFile, err := os.CreateTemp(dir, filepath.Base(filename)+".tmp.*")
@@ -1025,58 +1407,102 @@ func createModprobeConfig(card USBSoundCard, config Config, fileAccess *SafeFile
 		return nil
 	}
 	
-	// Acquire a lock on the modprobe file
-	_, err = fileAccess.LockFile(modprobeFile)
-	if err != nil {
-		slog.Warn("Failed to acquire lock on modprobe file, continuing with caution", 
-			"path", modprobeFile, "error", err)
-	} else {
-		defer fileAccess.UnlockFile(modprobeFile)
-	}
-	
 	var contentBuilder strings.Builder
 	contentBuilder.WriteString(fmt.Sprintf("# Modprobe options for USB sound card %s %s\n", 
 		card.Vendor, card.Product))
 	contentBuilder.WriteString("options snd_usb_audio index=-2\n")
 	
 	// Write the modprobe file atomically
-	if err := atomicWriteFile(modprobeFile, []byte(contentBuilder.String()), 0644, fileAccess); err != nil {
+	if err := atomicWriteFile(modprobeFile, []byte(contentBuilder.String()), 0644, fileAccess, config.Timeouts.LockAcquisition); err != nil {
 		return fmt.Errorf("failed to write modprobe configuration: %w", err)
 	}
 	
 	return nil
 }
 
-// reloadUdevRules triggers a reload of udev rules
+// reloadUdevRules triggers a reload of udev rules with transaction support
 func reloadUdevRules(ctx context.Context, executor *CommandExecutor, config Config) error {
 	if config.DryRun {
 		slog.Info("Dry run mode - skipping udev rules reload")
 		return nil
 	}
 	
-	// Reload udev rules
-	if _, err := executor.ExecuteCommand(ctx, "udevadm", "control", "--reload-rules"); err != nil {
-		return fmt.Errorf("failed to reload udev rules: %w", err)
+	// Create a transaction for rule reloading
+	transaction := NewTransaction()
+	
+	// Add rule reload to transaction
+	transaction.AddOperation(
+		// Reload operation
+		func() error {
+			_, err := executor.ExecuteCommand(ctx, "udevadm", "control", "--reload-rules")
+			if err != nil {
+				return fmt.Errorf("failed to reload udev rules: %w", err)
+			}
+			
+			// Sleep to give udev time to process the rule reloading
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(config.Timeouts.RuleReloadWait):
+				// Continue
+			}
+			
+			return nil
+		},
+		// No rollback needed
+		func() error { return nil },
+	)
+	
+	// Add trigger with add action to transaction
+	transaction.AddOperation(
+		// Trigger operation
+		func() error {
+			_, err := executor.ExecuteCommand(ctx, "udevadm", "trigger", "--action=add", "--subsystem-match=sound")
+			if err != nil {
+				return fmt.Errorf("failed to trigger udev rules with add action: %w", err)
+			}
+			
+			// Sleep to give udev time to apply the rules
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(config.Timeouts.TriggerActionWait):
+				// Continue
+			}
+			
+			return nil
+		},
+		// No rollback needed
+		func() error { return nil },
+	)
+	
+	// Add trigger with change action to transaction
+	transaction.AddOperation(
+		// Trigger operation
+		func() error {
+			_, err := executor.ExecuteCommand(ctx, "udevadm", "trigger", "--action=change", "--subsystem-match=sound")
+			if err != nil {
+				return fmt.Errorf("failed to trigger udev rules with change action: %w", err)
+			}
+			
+			// Sleep to give udev time to apply the rules
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(config.Timeouts.TriggerActionWait):
+				// Continue
+			}
+			
+			return nil
+		},
+		// No rollback needed
+		func() error { return nil },
+	)
+	
+	// Execute the transaction
+	if err := transaction.Execute(); err != nil {
+		return err
 	}
-	
-	// Sleep to give udev time to process the rule reloading
-	time.Sleep(config.Timeouts.RuleReloadWait)
-	
-	// Trigger the rules for all sound devices - using add action for more reliable application
-	if _, err := executor.ExecuteCommand(ctx, "udevadm", "trigger", "--action=add", "--subsystem-match=sound"); err != nil {
-		return fmt.Errorf("failed to trigger udev rules with add action: %w", err)
-	}
-
-	// Sleep to give udev time to apply the rules
-	time.Sleep(config.Timeouts.TriggerActionWait)
-	
-	// Also trigger with change action as a fallback
-	if _, err := executor.ExecuteCommand(ctx, "udevadm", "trigger", "--action=change", "--subsystem-match=sound"); err != nil {
-		return fmt.Errorf("failed to trigger udev rules with change action: %w", err)
-	}
-	
-	// Sleep again to ensure rules are fully applied
-	time.Sleep(config.Timeouts.TriggerActionWait)
 	
 	return nil
 }
@@ -1100,50 +1526,91 @@ func verifyUdevRuleInstallation(ctx context.Context, executor *CommandExecutor, 
 		return false, ErrDeviceDisconnected
 	}
 	
-	// Check if udev rules were reloaded successfully
-	output, err := executor.ExecuteCommand(ctx, "udevadm", "info", "--path", cardPath)
-	if err != nil {
-		return false, fmt.Errorf("failed to verify udev rule installation: %w", err)
+	// Try multiple verification methods to be thorough
+	var verificationMethods = []struct {
+		name     string
+		function func() (bool, error)
+	}{
+		{
+			name: "udevadm info",
+			function: func() (bool, error) {
+				output, err := executor.ExecuteCommand(ctx, "udevadm", "info", "--path", cardPath)
+				if err != nil {
+					return false, fmt.Errorf("failed to get udevadm info: %w", err)
+				}
+				
+				return strings.Contains(output, fmt.Sprintf("ID_SOUND_ID=%s", customName)), nil
+			},
+		},
+		{
+			name: "symlink check",
+			function: func() (bool, error) {
+				symlinkPath := fmt.Sprintf("/dev/sound/by-id/%s", customName)
+				exists, err := fileExists(symlinkPath)
+				if err != nil {
+					return false, fmt.Errorf("error checking symlink existence: %w", err)
+				}
+				return exists, nil
+			},
+		},
+		{
+			name: "udevadm trigger",
+			function: func() (bool, error) {
+				_, err := executor.ExecuteCommand(ctx, "udevadm", "trigger", "--action=add", 
+					"--property-match=SUBSYSTEM=sound", 
+					fmt.Sprintf("--property-match=ID_VENDOR_ID=%s", card.VendorID),
+					fmt.Sprintf("--property-match=ID_MODEL_ID=%s", card.ProductID))
+				
+				if err != nil {
+					return false, fmt.Errorf("failed to trigger specific udev rules: %w", err)
+				}
+				
+				// Give it a moment to apply
+				select {
+				case <-ctx.Done():
+					return false, ctx.Err()
+				case <-time.After(config.Timeouts.TriggerActionWait):
+					// Continue
+				}
+				
+				// Check again for the symlink
+				symlinkPath := fmt.Sprintf("/dev/sound/by-id/%s", customName)
+				exists, err := fileExists(symlinkPath)
+				if err != nil {
+					return false, fmt.Errorf("error checking symlink existence: %w", err)
+				}
+				return exists, nil
+			},
+		},
+		{
+			name: "aplay output",
+			function: func() (bool, error) {
+				aplayOutput, err := executor.ExecuteCommand(ctx, "aplay", "-L")
+				if err != nil {
+					return false, fmt.Errorf("failed to check aplay -L output: %w", err)
+				}
+				return strings.Contains(aplayOutput, customName), nil
+			},
+		},
 	}
-
-	// Look for the custom name in the output
-	if strings.Contains(output, fmt.Sprintf("ID_SOUND_ID=%s", customName)) {
-		slog.Info("Verified successful udev rule installation!")
-		return true, nil
-	}
-
-	// Try another method - check if the symlinks were created
-	symlinkPath := fmt.Sprintf("/dev/sound/by-id/%s", customName)
-	exists, err = fileExists(symlinkPath)
-	if err != nil {
-		slog.Warn("Error checking symlink existence", "path", symlinkPath, "error", err)
-	} else if exists {
-		slog.Info("Verified successful udev rule installation via symlink!")
-		return true, nil
-	}
-
-	// If not found, try to trigger the rule specifically for this device
-	slog.Info("Rule verification failed. Trying to trigger rules specifically for this device...")
 	
-	_, err = executor.ExecuteCommand(ctx, "udevadm", "trigger", "--action=add", 
-		"--property-match=SUBSYSTEM=sound", 
-		fmt.Sprintf("--property-match=ID_VENDOR_ID=%s", card.VendorID),
-		fmt.Sprintf("--property-match=ID_MODEL_ID=%s", card.ProductID))
-	
-	if err != nil {
-		return false, fmt.Errorf("failed to trigger specific udev rules: %w", err)
-	}
-
-	// Give it a moment to apply
-	time.Sleep(config.Timeouts.TriggerActionWait)
-	
-	// Last check: see if we can find the device in aplay -L output
-	aplayOutput, err := executor.ExecuteCommand(ctx, "aplay", "-L")
-	if err != nil {
-		slog.Warn("Failed to check aplay -L output", "error", err)
-	} else if strings.Contains(aplayOutput, customName) {
-		slog.Info("Verified successful udev rule installation via aplay -L output!")
-		return true, nil
+	// Try each verification method
+	for _, method := range verificationMethods {
+		// Check if context is canceled
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		
+		success, err := method.function()
+		if err != nil {
+			slog.Warn(fmt.Sprintf("Verification method %s failed", method.name), "error", err)
+			continue
+		}
+		
+		if success {
+			slog.Info(fmt.Sprintf("Verified successful udev rule installation via %s!", method.name))
+			return true, nil
+		}
 	}
 	
 	// If all verification methods failed
@@ -1166,6 +1633,15 @@ func backupExistingUdevRules(card USBSoundCard, config Config, fileAccess *SafeF
 		return nil
 	}
 	
+	// Check if we've exceeded the backup limit
+	backupDir := filepath.Join(config.UdevRulesPath, "backups")
+	
+	// Create backup directory if needed
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		slog.Warn("Failed to create backup directory", "error", err)
+		// Continue anyway - we'll use the main rules directory
+	}
+	
 	// Pattern for rule files we might want to back up
 	patterns := []string{
 		fmt.Sprintf("*usb*soundcard*%s*%s*.rules", card.VendorID, card.ProductID),
@@ -1175,8 +1651,35 @@ func backupExistingUdevRules(card USBSoundCard, config Config, fileAccess *SafeF
 		fmt.Sprintf("*audio*%s*%s*.rules", card.VendorID, card.ProductID),
 	}
 
+	// Count existing backups to enforce limits
+	existingBackups := 0
+	backupPrefix := fmt.Sprintf("backup_%s_%s_", card.VendorID, card.ProductID)
+	
+	entries, err := os.ReadDir(backupDir)
+	if err == nil {
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), backupPrefix) {
+				existingBackups++
+			}
+		}
+	}
+	
+	// Check if we've hit the backup limit
+	if existingBackups >= config.MaxBackupCount {
+		slog.Warn("Backup limit reached, skipping additional backups", 
+			"limit", config.MaxBackupCount, 
+			"existing", existingBackups)
+		return nil
+	}
+
 	backupCount := 0
 	for _, pattern := range patterns {
+		// Check context cancellation
+		if backupCount >= config.MaxBackupCount {
+			slog.Info("Reached maximum backup count", "max", config.MaxBackupCount)
+			break
+		}
+		
 		matches, err := filepath.Glob(filepath.Join(config.UdevRulesPath, pattern))
 		if err != nil {
 			slog.Error("Error searching for existing rules", "error", err)
@@ -1190,32 +1693,65 @@ func backupExistingUdevRules(card USBSoundCard, config Config, fileAccess *SafeF
 			}
 
 			// Create backup with timestamp
-			backupFile := match + ".bak." + time.Now().Format("20060102150405")
+			timestamp := time.Now().Format("20060102150405")
+			backupFile := filepath.Join(backupDir, fmt.Sprintf("%s%s_%s", 
+				backupPrefix, filepath.Base(match), timestamp))
+				
 			slog.Info("Backing up existing rule file", "source", match, "backup", backupFile)
 
-			// Acquire a lock on the source file
-			_, err := fileAccess.LockFile(match)
-			if err != nil {
-				slog.Warn("Failed to acquire lock on file during backup, continuing with caution", 
-					"path", match, "error", err)
-			} else {
-				defer fileAccess.UnlockFile(match)
-			}
-
-			content, err := os.ReadFile(match)
-			if err != nil {
-				slog.Error("Failed to read existing rule file", "file", match, "error", err)
-				continue
-			}
-
-			// Use atomic write for backup too
-			err = atomicWriteFile(backupFile, content, 0644, fileAccess)
-			if err != nil {
-				slog.Error("Failed to write backup file", "file", backupFile, "error", err)
+			// Create a transaction for the backup
+			transaction := NewTransaction()
+			
+			// Add file reading to transaction
+			var content []byte
+			transaction.AddOperation(
+				func() error {
+					// Acquire a lock on the source file
+					_, err := fileAccess.LockFile(match, config.Timeouts.LockAcquisition)
+					if err != nil {
+						return fmt.Errorf("failed to acquire lock on file during backup: %w", err)
+					}
+					defer fileAccess.UnlockFile(match)
+					
+					// Read the file
+					c, err := os.ReadFile(match)
+					if err != nil {
+						return fmt.Errorf("failed to read file: %w", err)
+					}
+					
+					content = c
+					return nil
+				},
+				// No rollback needed for reading
+				func() error { return nil },
+			)
+			
+			// Add file writing to transaction
+			transaction.AddOperation(
+				func() error {
+					// Use atomic write for backup
+					return atomicWriteFile(backupFile, content, 0644, fileAccess, config.Timeouts.LockAcquisition)
+				},
+				// Rollback - delete the backup file
+				func() error {
+					if exists, _ := fileExists(backupFile); exists {
+						return os.Remove(backupFile)
+					}
+					return nil
+				},
+			)
+			
+			// Execute the transaction
+			if err := transaction.Execute(); err != nil {
+				slog.Error("Failed to back up rule file", "source", match, "error", err)
 				continue
 			}
 			
 			backupCount++
+			if backupCount >= config.MaxBackupCount {
+				slog.Info("Reached maximum backup count", "max", config.MaxBackupCount)
+				break
+			}
 		}
 	}
 
@@ -1234,53 +1770,105 @@ func testUdevSystem(ctx context.Context, executor *CommandExecutor, config Confi
 		return true, nil
 	}
 	
+	// Create a transaction for testing
+	transaction := NewTransaction()
+	
 	// Create a small test rule
 	testRuleFile := filepath.Join(config.UdevRulesPath, "99-test-usb-soundcard-mapper.rules")
 	testRuleContent := "# Test rule to check if udev is functioning properly\n"
 	
-	// Write test rule
-	_, err := fileAccess.LockFile(testRuleFile)
-	if err != nil {
-		slog.Warn("Failed to acquire lock on test rule file, continuing with caution", 
-			"path", testRuleFile, "error", err)
-	} else {
-		defer fileAccess.UnlockFile(testRuleFile)
+	// Add rule writing to transaction
+	transaction.AddOperation(
+		// Write test rule
+		func() error {
+			// Acquire a lock on the test rule file
+			_, err := fileAccess.LockFile(testRuleFile, config.Timeouts.LockAcquisition)
+			if err != nil {
+				return fmt.Errorf("failed to acquire lock on test rule file: %w", err)
+			}
+			defer fileAccess.UnlockFile(testRuleFile)
+			
+			return os.WriteFile(testRuleFile, []byte(testRuleContent), 0644)
+		},
+		// Rollback - remove the test rule
+		func() error {
+			removeErr := os.Remove(testRuleFile)
+			if removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
+				slog.Error("Failed to remove test udev rule", "error", removeErr)
+			}
+			return nil
+		},
+	)
+	
+	// Add rule reloading to transaction
+	transaction.AddOperation(
+		// Reload rules
+		func() error {
+			_, err := executor.ExecuteCommand(ctx, "udevadm", "control", "--reload-rules")
+			if err != nil {
+				return fmt.Errorf("failed to reload udev rules during test: %w", err)
+			}
+			
+			// Wait briefly to ensure reload completes
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(config.Timeouts.RuleReloadWait):
+				// Continue
+			}
+			
+			return nil
+		},
+		// No rollback needed
+		func() error { return nil },
+	)
+	
+	// Add rule triggering to transaction
+	transaction.AddOperation(
+		// Trigger rules
+		func() error {
+			_, err := executor.ExecuteCommand(ctx, "udevadm", "trigger", "--action=add", "--subsystem-match=usb")
+			if err != nil {
+				return fmt.Errorf("failed to trigger udev rules during test: %w", err)
+			}
+			return nil
+		},
+		// No rollback needed
+		func() error { return nil },
+	)
+	
+	// Add cleanup to transaction
+	transaction.AddOperation(
+		// Remove test rule
+		func() error {
+			removeErr := os.Remove(testRuleFile)
+			if removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
+				slog.Error("Failed to remove test udev rule", "error", removeErr)
+				return fmt.Errorf("failed to remove test rule: %w", removeErr)
+			}
+			return nil
+		},
+		// No rollback needed
+		func() error { return nil },
+	)
+	
+	// Execute the transaction
+	if err := transaction.Execute(); err != nil {
+		return false, fmt.Errorf("udev system test failed: %w", err)
 	}
 	
-	err = os.WriteFile(testRuleFile, []byte(testRuleContent), 0644)
-	if err != nil {
-		return false, fmt.Errorf("failed to write test udev rule: %w", err)
-	}
-	
-	// Make sure we clean up even on panic
-	defer func() {
-		removeErr := os.Remove(testRuleFile)
-		if removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
-			slog.Error("Failed to remove test udev rule", "error", removeErr)
-		}
-	}()
-	
-	// Try to reload udev rules
-	_, err = executor.ExecuteCommand(ctx, "udevadm", "control", "--reload-rules")
-	if err != nil {
-		return false, fmt.Errorf("failed to reload udev rules during test: %w", err)
-	}
-	
-	// Wait briefly to ensure reload completes
-	time.Sleep(config.Timeouts.RuleReloadWait)
-	
-	// Try triggering rules to ensure the system responds
-	_, err = executor.ExecuteCommand(ctx, "udevadm", "trigger", "--action=add", "--subsystem-match=usb")
-	if err != nil {
-		return false, fmt.Errorf("failed to trigger udev rules during test: %w", err)
-	}
-	
+	transaction.Commit()
 	slog.Info("Udev system test passed")
 	return true, nil
 }
 
 // checkAndFixPermissions ensures the udev rules directory has the correct permissions
 func checkAndFixPermissions(config Config) error {
+	// Validate the path for safety
+	if !pathSafeRegex.MatchString(config.UdevRulesPath) {
+		return fmt.Errorf("unsafe udev rules path: %s: %w", config.UdevRulesPath, ErrInvalidPath)
+	}
+	
 	// Check if the rules directory exists and has correct permissions
 	info, err := os.Stat(config.UdevRulesPath)
 	if err != nil {
@@ -1407,6 +1995,11 @@ func findAllUSBDevices(ctx context.Context, executor *CommandExecutor) (map[stri
 
 // fileExists checks if a file exists and is not a directory
 func fileExists(filename string) (bool, error) {
+	// Validate the path for safety
+	if !pathSafeRegex.MatchString(filename) {
+		return false, fmt.Errorf("unsafe file path: %s: %w", filename, ErrInvalidPath)
+	}
+	
 	info, err := os.Stat(filename)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -1419,6 +2012,11 @@ func fileExists(filename string) (bool, error) {
 
 // directoryExists checks if a directory exists
 func directoryExists(path string) (bool, error) {
+	// Validate the path for safety
+	if !pathSafeRegex.MatchString(path) {
+		return false, fmt.Errorf("unsafe directory path: %s: %w", path, ErrInvalidPath)
+	}
+	
 	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -1431,6 +2029,11 @@ func directoryExists(path string) (bool, error) {
 
 // pathExists checks if a path exists (file or directory)
 func pathExists(path string) (bool, error) {
+	// Validate the path for safety
+	if !pathSafeRegex.MatchString(path) {
+		return false, fmt.Errorf("unsafe path: %s: %w", path, ErrInvalidPath)
+	}
+	
 	_, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -1442,22 +2045,53 @@ func pathExists(path string) (bool, error) {
 }
 
 // setupSignalHandling sets up graceful shutdown on system signals
-func setupSignalHandling(ctx context.Context, cancel context.CancelFunc, fileAccess *SafeFileAccess) {
+func setupSignalHandling(ctx context.Context, cancel context.CancelFunc, resourceTracker *ResourceTracker, config Config) {
 	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP, 
+		syscall.SIGQUIT, syscall.SIGINT, syscall.SIGABRT)
 	
 	go func() {
 		select {
 		case sig := <-c:
 			slog.Info("Received signal, shutting down gracefully", "signal", sig)
-			// Clean up all file locks
-			fileAccess.CleanupAllLocks()
+			
 			// Cancel the context to stop ongoing operations
 			cancel()
+			
+			// Create a context with timeout for graceful shutdown
+			shutdownCtx, shutdownCancel := context.WithTimeout(
+				context.Background(), 
+				config.Timeouts.GracefulShutdown,
+			)
+			defer shutdownCancel()
+			
+			// Wait for operations to complete with timeout
+			err := resourceTracker.WaitForCompletion(config.Timeouts.GracefulShutdown)
+			if err != nil {
+				slog.Error("Error waiting for operations to complete", "error", err)
+			}
+			
+			// Clean up all resources
+			errs := resourceTracker.CleanupAll()
+			if len(errs) > 0 {
+				for _, err := range errs {
+					slog.Error("Error during resource cleanup", "error", err)
+				}
+			}
+			
+			// If timeout occurred during shutdown
+			select {
+			case <-shutdownCtx.Done():
+				if errors.Is(shutdownCtx.Err(), context.DeadlineExceeded) {
+					slog.Error("Graceful shutdown timed out, forcing exit")
+					os.Exit(1)
+				}
+			default:
+				// Normal shutdown
+			}
+			
 		case <-ctx.Done():
 			// Context was canceled elsewhere
-			// Clean up all file locks
-			fileAccess.CleanupAllLocks()
 			return
 		}
 	}()
@@ -1644,10 +2278,13 @@ type uiModel struct {
 	successMessage  string
 	ctx             context.Context
 	cancel          context.CancelFunc
+	resourceTracker *ResourceTracker
+	operationLock   sync.Mutex
+	uiClosed        bool
 }
 
 // Initialize UI model
-func initialUIModel(cards []USBSoundCard, config Config, executor *CommandExecutor, fileAccess *SafeFileAccess) uiModel {
+func initialUIModel(cards []USBSoundCard, config Config, executor *CommandExecutor, fileAccess *SafeFileAccess, resourceTracker *ResourceTracker) uiModel {
 	// Create a context for the UI operations
 	ctx, cancel := context.WithCancel(context.Background())
 	
@@ -1673,21 +2310,58 @@ func initialUIModel(cards []USBSoundCard, config Config, executor *CommandExecut
 	ti.Prompt = "› "
 	
 	return uiModel{
-		cards:      cards,
-		list:       l,
-		textInput:  ti,
-		state:      stateCardSelect,
-		config:     config,
-		executor:   executor,
-		fileAccess: fileAccess,
-		ctx:        ctx,
-		cancel:     cancel,
+		cards:           cards,
+		list:            l,
+		textInput:       ti,
+		state:           stateCardSelect,
+		config:          config,
+		executor:        executor,
+		fileAccess:      fileAccess,
+		ctx:             ctx,
+		cancel:          cancel,
+		resourceTracker: resourceTracker,
 	}
 }
 
 // Initialize the model
 func (m uiModel) Init() tea.Cmd {
 	return nil
+}
+
+// safelyPerformBackgroundOperation executes a background operation with proper error handling
+func (m *uiModel) safelyPerformBackgroundOperation(operation func() (string, error)) tea.Cmd {
+	return func() tea.Msg {
+		// Ensure we don't run multiple operations simultaneously
+		m.operationLock.Lock()
+		defer m.operationLock.Unlock()
+		
+		// Check if UI is closed
+		if m.uiClosed {
+			return nil
+		}
+		
+		// Check if context is canceled
+		if m.ctx.Err() != nil {
+			return errMsg{err: m.ctx.Err()}
+		}
+		
+		// Execute the operation
+		result, err := operation()
+		if err != nil {
+			return errMsg{err: err}
+		}
+		
+		return successMsg{message: result}
+	}
+}
+
+// Custom messages for handling background operations
+type successMsg struct {
+	message string
+}
+
+type errMsg struct {
+	err error
 }
 
 // Handle user input and state transitions
@@ -1704,12 +2378,33 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h, v := docStyle.GetFrameSize()
 		m.list.SetSize(msg.Width-h, msg.Height-v)
 		
+	case successMsg:
+		// Handle operation success
+		m.successMessage = msg.message
+		m.state = stateSuccess
+		return m, nil
+		
+	case errMsg:
+		// Handle operation error
+		if errors.Is(msg.err, context.Canceled) {
+			// Operation was canceled - exit gracefully
+			m.cancel()
+			m.uiClosed = true
+			return m, tea.Quit
+		}
+		
+		// Set error message and transition to error state
+		m.error = msg.err.Error()
+		m.state = stateError
+		return m, nil
+		
 	case tea.KeyMsg:
 		// Global key handlers
 		switch {
 		case key.Matches(msg, keys.Quit):
 			slog.Debug("User quit application")
 			m.cancel() // Cancel the context
+			m.uiClosed = true
 			return m, tea.Quit
 		}
 		
@@ -1792,70 +2487,65 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case stateConfirmation:
 			switch {
 			case key.Matches(msg, keys.Confirm):
-				// Create udev rule with custom name
-				rule, err := createUdevRule(m.ctx, m.selectedCard, m.customName, m.config)
-				if err != nil {
-					slog.Error("Failed to create udev rule", "error", err)
-					m.error = fmt.Sprintf("Failed to create udev rule: %v", err)
-					m.state = stateError
-					return m, nil
-				}
-				
-				// Backup existing rules for this device
-				if err := backupExistingUdevRules(m.selectedCard, m.config, m.fileAccess); err != nil {
-					slog.Warn("Failed to backup existing rules", "error", err)
-				}
-				
-				// Install the rule
-				if err := installUdevRule(m.ctx, rule, m.config, m.fileAccess); err != nil {
-					slog.Error("Failed to install udev rule", "error", err)
-					m.error = fmt.Sprintf("Failed to install udev rule: %v", err)
-					m.state = stateError
-					return m, nil
-				}
-				
-				// Reload udev rules if not skipped
-				if !m.config.SkipReload {
-					if err := reloadUdevRules(m.ctx, m.executor, m.config); err != nil {
-						slog.Error("Failed to reload udev rules", "error", err)
-						m.error = fmt.Sprintf("Failed to reload udev rules: %v", err)
-						m.state = stateError
-						return m, nil
+				// Run the installation in the background to keep UI responsive
+				return m, m.safelyPerformBackgroundOperation(func() (string, error) {
+					// Create udev rule with custom name
+					rule, err := createUdevRule(m.ctx, m.selectedCard, m.customName, m.config)
+					if err != nil {
+						slog.Error("Failed to create udev rule", "error", err)
+						return "", fmt.Errorf("failed to create udev rule: %w", err)
 					}
 					
-					// Verify the rule installation
-					success, err := verifyUdevRuleInstallation(m.ctx, m.executor, m.selectedCard, m.customName, m.config)
-					if err != nil {
-						if errors.Is(err, ErrDeviceDisconnected) {
-							m.warning = "Device appears to have been disconnected. Rules were created but could not be verified."
-						} else {
-							slog.Warn("Rule verification issue", "error", err)
-							m.warning = fmt.Sprintf("Rules created but verification had issues: %v", err)
-						}
-					} else if !success {
-						m.warning = "Rules created but verification could not confirm they were applied correctly."
+					// Backup existing rules for this device
+					if err := backupExistingUdevRules(m.selectedCard, m.config, m.fileAccess); err != nil {
+						slog.Warn("Failed to backup existing rules", "error", err)
 					}
-				}
-				
-				// Success message
-				var messageBuilder strings.Builder
-				messageBuilder.WriteString(fmt.Sprintf("Created persistent mapping for %s %s (VID:PID %s:%s) as '%s'\n\n",
-					m.selectedCard.Vendor, m.selectedCard.Product, 
-					m.selectedCard.VendorID, m.selectedCard.ProductID, 
-					m.customName))
-				
-				messageBuilder.WriteString(
-					"The sound card will use this name consistently across reboots and reconnections.\n"+
-					"You can see this device in 'aplay -l' output as card with ID '%s'\n"+
-					"once you disconnect and reconnect the device.\n")
-				
-				if m.warning != "" {
-					messageBuilder.WriteString("\nWarning: " + m.warning)
-				}
-				
-				m.successMessage = messageBuilder.String()
-				m.state = stateSuccess
-				return m, nil
+					
+					// Install the rule
+					if err := installUdevRule(m.ctx, rule, m.config, m.fileAccess); err != nil {
+						slog.Error("Failed to install udev rule", "error", err)
+						return "", fmt.Errorf("failed to install udev rule: %w", err)
+					}
+					
+					// Reload udev rules if not skipped
+					if !m.config.SkipReload {
+						if err := reloadUdevRules(m.ctx, m.executor, m.config); err != nil {
+							slog.Error("Failed to reload udev rules", "error", err)
+							return "", fmt.Errorf("failed to reload udev rules: %w", err)
+						}
+						
+						// Verify the rule installation
+						success, err := verifyUdevRuleInstallation(m.ctx, m.executor, m.selectedCard, m.customName, m.config)
+						if err != nil {
+							if errors.Is(err, ErrDeviceDisconnected) {
+								m.warning = "Device appears to have been disconnected. Rules were created but could not be verified."
+							} else {
+								slog.Warn("Rule verification issue", "error", err)
+								m.warning = fmt.Sprintf("Rules created but verification had issues: %v", err)
+							}
+						} else if !success {
+							m.warning = "Rules created but verification could not confirm they were applied correctly."
+						}
+					}
+					
+					// Success message
+					var messageBuilder strings.Builder
+					messageBuilder.WriteString(fmt.Sprintf("Created persistent mapping for %s %s (VID:PID %s:%s) as '%s'\n\n",
+						m.selectedCard.Vendor, m.selectedCard.Product, 
+						m.selectedCard.VendorID, m.selectedCard.ProductID, 
+						m.customName))
+					
+					messageBuilder.WriteString(
+						"The sound card will use this name consistently across reboots and reconnections.\n"+
+						"You can see this device in 'aplay -l' output as card with ID '%s'\n"+
+						"once you disconnect and reconnect the device.\n")
+					
+					if m.warning != "" {
+						messageBuilder.WriteString("\nWarning: " + m.warning)
+					}
+					
+					return messageBuilder.String(), nil
+				})
 				
 			case key.Matches(msg, keys.Back):
 				// Return to name input
@@ -1872,6 +2562,7 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case stateSuccess:
 			// Quit on any key press
 			m.cancel() // Cancel the context before quitting
+			m.uiClosed = true
 			return m, tea.Quit
 		}
 	}
@@ -1963,54 +2654,50 @@ func (m uiModel) View() string {
 }
 
 // runUI starts the terminal UI for interactive mode
-func runUI(ctx context.Context, cards []USBSoundCard, config Config, executor *CommandExecutor, fileAccess *SafeFileAccess) (string, error) {
+func runUI(ctx context.Context, cards []USBSoundCard, config Config, executor *CommandExecutor, fileAccess *SafeFileAccess, resourceTracker *ResourceTracker) (string, error) {
 	if len(cards) == 0 {
 		return "", ErrNoUSBSoundCards
 	}
 	
-	model := initialUIModel(cards, config, executor, fileAccess)
+	model := initialUIModel(cards, config, executor, fileAccess, resourceTracker)
 	
 	// Create a new program with alt screen enabled
 	p := tea.NewProgram(model, tea.WithAltScreen())
 	
-	// Run in a goroutine to handle context cancellation
-	resultCh := make(chan tea.Model, 1)
-	errCh := make(chan error, 1)
-	
+	// Set up a channel to handle context cancellation
+	cancelCh := make(chan struct{})
 	go func() {
-		m, err := p.Run()
-		if err != nil {
-			errCh <- err
+		select {
+		case <-ctx.Done():
+			// Context was canceled, send a quit message to the program
+			p.Send(errMsg{err: ctx.Err()})
+		case <-cancelCh:
+			// Program finished normally, clean up
 			return
 		}
-		resultCh <- m
 	}()
 	
-	// Wait for either context done or UI completion
-	select {
-	case <-ctx.Done():
-		// Context was canceled, shutdown the UI
-		p.Quit()
-		return "", ctx.Err()
-		
-	case err := <-errCh:
+	// Run the UI
+	finalModel, err := p.Run()
+	close(cancelCh) // Signal that the program is done
+	
+	if err != nil {
 		return "", fmt.Errorf("UI error: %w", err)
-		
-	case m := <-resultCh:
-		// UI completed normally
-		model, ok := m.(uiModel)
-		if !ok {
-			return "", fmt.Errorf("unexpected model type returned from UI")
-		}
-		
-		// Return success message if we have one
-		if model.successMessage != "" {
-			return model.successMessage, nil
-		}
-		
-		// If we don't have a success message, the user probably quit early
-		return "", ErrOperationCancelled
 	}
+	
+	// Extract the model
+	m, ok := finalModel.(uiModel)
+	if !ok {
+		return "", fmt.Errorf("unexpected model type returned from UI")
+	}
+	
+	// Check if we have a success message
+	if m.successMessage != "" {
+		return m.successMessage, nil
+	}
+	
+	// If we don't have a success message, the user probably quit early
+	return "", ErrOperationCancelled
 }
 
 // nonInteractiveMode handles the non-interactive operation
@@ -2018,6 +2705,15 @@ func nonInteractiveMode(ctx context.Context, config Config, executor *CommandExe
 	// Validate required parameters
 	if config.VendorID == "" || config.ProductID == "" {
 		return fmt.Errorf("in non-interactive mode, --vendor-id and --product-id are required: %w", ErrInvalidDeviceParams)
+	}
+	
+	// Validate vendor and product IDs
+	if !vendorIDRegex.MatchString(config.VendorID) {
+		return fmt.Errorf("invalid vendor ID format: %s: %w", config.VendorID, ErrInvalidDeviceParams)
+	}
+	
+	if !productIDRegex.MatchString(config.ProductID) {
+		return fmt.Errorf("invalid product ID format: %s: %w", config.ProductID, ErrInvalidDeviceParams)
 	}
 	
 	// Find the card that matches the vendor and product IDs
@@ -2056,30 +2752,61 @@ func nonInteractiveMode(ctx context.Context, config Config, executor *CommandExe
 		return ErrDeviceNameEmpty
 	}
 	
-	// Backup any existing rules for this device
-	if err := backupExistingUdevRules(selectedCard, config, fileAccess); err != nil {
-		slog.Warn("Failed to backup existing rules", "error", err)
-		// Continue anyway - this is not fatal
-	}
+	// Create a transaction for the entire operation
+	transaction := NewTransaction()
 	
-	// Create udev rule
-	rule, err := createUdevRule(ctx, selectedCard, customName, config)
-	if err != nil {
-		return fmt.Errorf("failed to create udev rule: %w", err)
-	}
+	// Add backup operation to transaction
+	transaction.AddOperation(
+		func() error {
+			return backupExistingUdevRules(selectedCard, config, fileAccess)
+		},
+		// No rollback needed for backup
+		func() error { return nil },
+	)
 	
-	// Install the rule
-	if err := installUdevRule(ctx, rule, config, fileAccess); err != nil {
-		return fmt.Errorf("failed to install udev rule: %w", err)
-	}
+	// Add rule creation and installation to transaction
+	var rule *UdevRule
+	transaction.AddOperation(
+		func() error {
+			var err error
+			// Create udev rule
+			rule, err = createUdevRule(ctx, selectedCard, customName, config)
+			if err != nil {
+				return fmt.Errorf("failed to create udev rule: %w", err)
+			}
+			
+			// Install the rule
+			return installUdevRule(ctx, rule, config, fileAccess)
+		},
+		// Rollback - remove the rule file if it was created
+		func() error {
+			if rule != nil && !config.DryRun {
+				if exists, _ := fileExists(rule.Path); exists {
+					return os.Remove(rule.Path)
+				}
+			}
+			return nil
+		},
+	)
 	
-	// Reload udev rules if not skipped
+	// Add rule reloading to transaction if not skipped
 	if !config.SkipReload {
-		if err := reloadUdevRules(ctx, executor, config); err != nil {
-			return fmt.Errorf("failed to reload udev rules: %w", err)
-		}
-		
-		// Verify the rule installation
+		transaction.AddOperation(
+			func() error {
+				return reloadUdevRules(ctx, executor, config)
+			},
+			// No rollback needed for reloading
+			func() error { return nil },
+		)
+	}
+	
+	// Execute the transaction
+	if err := transaction.Execute(); err != nil {
+		return fmt.Errorf("installation failed: %w", err)
+	}
+	
+	// Verify the installation if not in dry run mode and reloading wasn't skipped
+	if !config.DryRun && !config.SkipReload {
 		success, err := verifyUdevRuleInstallation(ctx, executor, selectedCard, customName, config)
 		if err != nil {
 			if errors.Is(err, ErrDeviceDisconnected) {
@@ -2105,6 +2832,8 @@ func nonInteractiveMode(ctx context.Context, config Config, executor *CommandExe
 	fmt.Println("\nFor immediate application of rules without rebooting, run:")
 	fmt.Printf("sudo udevadm control --reload-rules && sudo udevadm trigger --action=add --subsystem-match=sound\n")
 	
+	// Commit the transaction
+	transaction.Commit()
 	return nil
 }
 
@@ -2144,18 +2873,74 @@ func showDeviceList(cards []USBSoundCard) {
 	}
 }
 
+// validateConfig validates the configuration for consistency and safety
+func validateConfig(config *Config) error {
+	// Validate UdevRulesPath
+	if !pathSafeRegex.MatchString(config.UdevRulesPath) {
+		return fmt.Errorf("unsafe udev rules path: %s: %w", config.UdevRulesPath, ErrInvalidPath)
+	}
+	
+	// Make sure MaxBackupCount is reasonable
+	if config.MaxBackupCount <= 0 {
+		config.MaxBackupCount = maxBackupCount
+	}
+	
+	// Set resource limits if not specified
+	if config.ResourceLimits.MaxConcurrentOps <= 0 {
+		config.ResourceLimits.MaxConcurrentOps = config.ConcurrencyOpts.MaxWorkers
+	}
+	
+	if config.ResourceLimits.MaxQueueSize <= 0 {
+		config.ResourceLimits.MaxQueueSize = maxQueueSize
+	}
+	
+	if config.ResourceLimits.MaxFileSize <= 0 {
+		config.ResourceLimits.MaxFileSize = maxFileSize
+	}
+	
+	// Check for conflicting options
+	if config.DryRun && config.ForceOverwrite {
+		// Not a fatal error, but warn and prioritize dry run
+		slog.Warn("Both --dry-run and --force specified; dry run takes precedence")
+	}
+	
+	// If vendor ID or product ID is specified, validate their format
+	if config.VendorID != "" {
+		if !vendorIDRegex.MatchString(config.VendorID) {
+			return fmt.Errorf("invalid vendor ID format: %s: %w", config.VendorID, ErrInvalidDeviceParams)
+		}
+	}
+	
+	if config.ProductID != "" {
+		if !productIDRegex.MatchString(config.ProductID) {
+			return fmt.Errorf("invalid product ID format: %s: %w", config.ProductID, ErrInvalidDeviceParams)
+		}
+	}
+	
+	// Ensure LockAcquisition timeout is set
+	if config.Timeouts.LockAcquisition <= 0 {
+		config.Timeouts.LockAcquisition = DefaultTimeouts.LockAcquisition
+	}
+	
+	// Ensure GracefulShutdown timeout is set
+	if config.Timeouts.GracefulShutdown <= 0 {
+		config.Timeouts.GracefulShutdown = DefaultTimeouts.GracefulShutdown
+	}
+	
+	return nil
+}
+
 // main function
 func main() {
-	// Create a context for the entire application
+	// Create a root context for the entire application
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	
-	// Create safe file access manager
-	fileAccess := NewSafeFileAccess()
-	defer fileAccess.CleanupAllLocks()
+	// Create resource tracker
+	resourceTracker := NewResourceTracker()
 	
-	// Setup signal handling for graceful shutdown
-	setupSignalHandling(ctx, cancel, fileAccess)
+	// Create safe file access manager
+	fileAccess := NewSafeFileAccess(resourceTracker)
 	
 	// Parse command line flags
 	config := Config{
@@ -2166,9 +2951,16 @@ func main() {
 		MaxRetries:    3,
 		ForceOverwrite: false,
 		IgnoreVirtual:  false,
+		MaxBackupCount: maxBackupCount,
 		ConcurrencyOpts: ConcurrencyOptions{
 			MaxWorkers:     4,
-			OperationQueue: 100,
+			OperationQueue: maxQueueSize,
+		},
+		ResourceLimits: ResourceLimits{
+			MaxConcurrentOps:    4,
+			MaxQueueSize:        maxQueueSize,
+			MaxFileSize:         maxFileSize,
+			MaxBackupsPerDevice: maxBackupCount,
 		},
 	}
 	
@@ -2182,12 +2974,19 @@ func main() {
 	flag.BoolVar(&config.DryRun, "dry-run", false, "Show what would be done without making changes")
 	flag.BoolVar(&config.ForceOverwrite, "force", false, "Force overwrite existing rules and accept virtual devices")
 	flag.BoolVar(&config.IgnoreVirtual, "ignore-virtual", false, "Ignore virtual audio devices")
+	flag.IntVar(&config.MaxBackupCount, "max-backups", maxBackupCount, "Maximum number of backups to keep per device")
 	
 	var logLevelStr string
 	flag.StringVar(&logLevelStr, "log-level", string(LogLevelInfo), "Log level (debug, info, warn, error)")
 	
 	var commandTimeout int
 	flag.IntVar(&commandTimeout, "command-timeout", int(DefaultTimeouts.CommandExecution/time.Second), "Command execution timeout in seconds")
+	
+	var lockTimeout int
+	flag.IntVar(&lockTimeout, "lock-timeout", int(DefaultTimeouts.LockAcquisition/time.Second), "File lock acquisition timeout in seconds")
+	
+	var gracefulTimeout int
+	flag.IntVar(&gracefulTimeout, "graceful-timeout", int(DefaultTimeouts.GracefulShutdown/time.Second), "Graceful shutdown timeout in seconds")
 	
 	var retries int
 	flag.IntVar(&retries, "retries", config.MaxRetries, "Maximum number of retries for commands")
@@ -2213,7 +3012,15 @@ func main() {
 	
 	// Set timeouts from command line
 	config.Timeouts.CommandExecution = time.Duration(commandTimeout) * time.Second
+	config.Timeouts.LockAcquisition = time.Duration(lockTimeout) * time.Second
+	config.Timeouts.GracefulShutdown = time.Duration(gracefulTimeout) * time.Second
 	config.MaxRetries = retries
+	
+	// Validate configuration
+	if err := validateConfig(&config); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 	
 	// Initialize structured logging
 	initLogger(config.LogLevel)
@@ -2226,8 +3033,11 @@ func main() {
 		"force", config.ForceOverwrite,
 		"ignore_virtual", config.IgnoreVirtual)
 	
+	// Setup signal handling for graceful shutdown
+	setupSignalHandling(ctx, cancel, resourceTracker, config)
+	
 	// Create command executor
-	executor := NewCommandExecutor(config)
+	executor := NewCommandExecutor(config, resourceTracker)
 	
 	// Check if required commands are available
 	if err := CheckCommands(ctx, executor); err != nil {
@@ -2251,7 +3061,7 @@ func main() {
 		os.Exit(1)
 	}
 	
-	// Check and fix permissions on udev rules directory
+	// Check and fix permissions on udev rules directory if needed
 	if !config.ListOnly && !config.DryRun {
 		if err := checkAndFixPermissions(config); err != nil {
 			slog.Error("Permission check failed", "error", err)
@@ -2274,6 +3084,7 @@ func main() {
 		}
 	}
 	
+	// Check
 	// Check for PCI fallback serial numbers
 	hasPCISerials, err := checkPCIFallbackForSerials(ctx, executor)
 	if err != nil {
@@ -2297,6 +3108,22 @@ func main() {
 		// This is not fatal, continue anyway
 	} else {
 		slog.Debug("USB devices found", "count", len(allUSBDevices))
+	}
+	
+	// Check if context has been canceled
+	if ctx.Err() != nil {
+		slog.Info("Operation interrupted, shutting down")
+		fmt.Println("Operation interrupted. Shutting down...")
+		
+		// Ensure clean shutdown
+		errs := resourceTracker.CleanupAll()
+		if len(errs) > 0 {
+			for _, err := range errs {
+				slog.Error("Error during resource cleanup", "error", err)
+			}
+		}
+		
+		os.Exit(0)
 	}
 	
 	// List all USB sound cards
@@ -2331,14 +3158,14 @@ func main() {
 	}
 	
 	// Interactive mode - run the terminal UI
-	result, err := runUI(ctx, cards, config, executor, fileAccess)
+	result, err := runUI(ctx, cards, config, executor, fileAccess, resourceTracker)
 	if err != nil {
 		if errors.Is(err, ErrOperationCancelled) {
 			slog.Info("Operation cancelled by user")
 			fmt.Println("Operation cancelled by user.")
 			return
 		}
-		
+		 
 		if errors.Is(err, context.Canceled) {
 			slog.Info("Operation interrupted, shutting down")
 			fmt.Println("Operation interrupted. Shutting down...")
@@ -2369,5 +3196,13 @@ func main() {
 		// This is critical for reliable rule application - tell the user to run this specific command
 		fmt.Println("\nFor immediate application of rules without rebooting, run:")
 		fmt.Printf("sudo udevadm control --reload-rules && sudo udevadm trigger --action=add --subsystem-match=sound\n")
+	}
+	
+	// Perform final cleanup
+	if errs := resourceTracker.CleanupAll(); len(errs) > 0 {
+		slog.Warn("Some errors occurred during final cleanup", "count", len(errs))
+		for _, err := range errs {
+			slog.Error("Cleanup error", "error", err)
+		}
 	}
 }
